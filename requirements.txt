@@ -1,0 +1,9 @@
+pyTelegramBotAPI
+qrcode
+pillow
+requests
+gunicorn
+flask
+python-dotenv
+pymongo
+dnspython
