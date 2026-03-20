@@ -1367,7 +1367,8 @@ def handle_add_premium_ch(message):
             "id": ch_id,
             "name": name,
             "amount": price,
-            "channel_id": telegram_id
+            "channel_id": telegram_id,
+            "duration": "30 Days"
         })
         save_settings()
         bot.reply_to(message, f"✅ Added <b>{name}</b> (₹{price}) to membership list.", parse_mode="HTML")
