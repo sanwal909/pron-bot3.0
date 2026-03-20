@@ -302,7 +302,7 @@ You'll receive unique join link within few minutes.
 {invite_link}
 
 ⚠️ <b>Note:</b> This link can only be used ONCE.
-📅 <b>Access Duration:</b> {plan['duration']}
+📅 <b>Access Duration:</b> {plan.get('duration', '30 Days')}
 
 <b>Enjoy your demo! 🍿</b>
                 """
@@ -317,7 +317,7 @@ You'll receive unique join link within few minutes.
 {invite_link}
 
 ⚠️ <b>Note:</b> This link can only be used ONCE and is personal to you.
-📅 <b>Access Duration:</b> {plan['duration']}
+📅 <b>Access Duration:</b> {plan.get('duration', '30 Days')}
 
 <b>Welcome to Premium Family! 🎊</b>
                 """
