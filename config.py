@@ -149,14 +149,14 @@ DEFAULT_SETTINGS = {
     "payment_proof_status": True, # Enabled by default now
     "how_to_buy_url": "", # New: How to buy tutorial/guide URL
     "premium_channels": [
-        {"id": "ch1", "name": "Channel 1", "amount": "99", "channel_id": ""},
-        {"id": "ch2", "name": "Channel 2", "amount": "99", "channel_id": ""},
-        {"id": "ch3", "name": "Channel 3", "amount": "99", "channel_id": ""},
-        {"id": "ch4", "name": "Channel 4", "amount": "99", "channel_id": ""},
-        {"id": "ch5", "name": "Channel 5", "amount": "99", "channel_id": ""},
-        {"id": "ch6", "name": "Channel 6", "amount": "99", "channel_id": ""},
-        {"id": "ch7", "name": "Channel 7", "amount": "99", "channel_id": ""},
-        {"id": "all", "name": "All Channels", "amount": "299", "channel_ids": []}
+        {"id": "ch1", "name": "Channel 1", "amount": "99", "channel_id": "", "duration": "30 Days"},
+        {"id": "ch2", "name": "Channel 2", "amount": "99", "channel_id": "", "duration": "30 Days"},
+        {"id": "ch3", "name": "Channel 3", "amount": "99", "channel_id": "", "duration": "30 Days"},
+        {"id": "ch4", "name": "Channel 4", "amount": "99", "channel_id": "", "duration": "30 Days"},
+        {"id": "ch5", "name": "Channel 5", "amount": "99", "channel_id": "", "duration": "30 Days"},
+        {"id": "ch6", "name": "Channel 6", "amount": "99", "channel_id": "", "duration": "30 Days"},
+        {"id": "ch7", "name": "Channel 7", "amount": "99", "channel_id": "", "duration": "30 Days"},
+        {"id": "all", "name": "All Channels", "amount": "299", "channel_ids": [], "duration": "30 Days"}
     ]
 }
 
@@ -240,6 +240,9 @@ def get_plans():
     
     # Standard channels from settings
     for ch in settings.get("premium_channels", []):
+        # Ensure duration exists to avoid KeyErrors
+        if 'duration' not in ch:
+            ch['duration'] = "30 Days"
         plans[ch['id']] = ch
         
     # Add demo plan separately
