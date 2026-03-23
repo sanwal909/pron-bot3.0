@@ -141,6 +141,7 @@ DEFAULT_SETTINGS = {
     "membership_channels": [],
     "force_request_channel": "", # New field for request join
     "force_request_msg": "<b>✅ Join Request Received!</b>\n\nYour request has been received. Please wait for admin to accept, or you can start using the bot now if you have already sent the request.",
+    "force_join_status": True, # New: Toggle for force join system
     "auto_accept_requests": False, # New: Auto-accept join requests
     "demo_paid_status": False,
     "demo_amount": "10",
