@@ -141,6 +141,9 @@ Your join request has been accepted by our admin. You can now use all the bot's 
 # ========== MEMBERSHIP CHECK ==========
 def is_user_member(user_id):
     """Check if user joined or requested to join the required channel"""
+    if not settings.get('force_join_status', True):
+        return True
+        
     force_ch = settings.get('force_request_channel', '')
     
     # 1. Check if user is in our join_requests list (sent request but not yet accepted)
@@ -925,6 +928,7 @@ def handle_settings(message):
 
 <b>📞 Support:</b> @{settings.get('support_username', 'Not Set')}
 <b>📋 Log Channel:</b> {settings.get('log_channel', 'Not Set')}
+<b>🛡️ Force Join:</b> {'ON' if settings.get('force_join_status', True) else 'OFF'}
 <b>🤖 Auto-Accept:</b> {'ON' if settings.get('auto_accept_requests', False) else 'OFF'}
 <b>❓ Buy Guide:</b> {settings.get('how_to_buy_url', 'Not Set')}
 <b>🧾 Proof Channel:</b> {settings.get('payment_proof_link', 'Not Set')}
@@ -1301,6 +1305,18 @@ def handle_proof_toggle(message):
     
     status = "ON" if settings["payment_proof_status"] else "OFF"
     bot.reply_to(message, f"✅ Payment Proof button is now <b>{status}</b>.", parse_mode="HTML")
+
+@bot.message_handler(commands=['force_join_toggle'])
+def handle_force_join_toggle(message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return
+        
+    current = settings.get("force_join_status", True)
+    settings["force_join_status"] = not current
+    save_settings()
+    
+    status = "ON" if settings["force_join_status"] else "OFF"
+    bot.reply_to(message, f"✅ Force Join system is now <b>{status}</b>.", parse_mode="HTML")
 
 @bot.message_handler(commands=['set_proof_link'])
 def handle_set_proof_link(message):
@@ -2037,6 +2053,7 @@ For premium: Click "Get Premium" button
 /add_premium_ch id Full Name price channel_id - Add new channel
 /remove_premium_ch id - Remove channel
 /edit_premium_ch id key New Value - Edit channel
+/force_join_toggle - Toggle force join ON/OFF
 /support_toggle - Toggle support button ON/OFF
 /auto_accept - Toggle Auto-Accept Join Requests ON/OFF
 /approve_all - Approve all pending join requests
