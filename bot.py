@@ -1991,6 +1991,7 @@ def handle_pending(message):
     for uid, data in pending_verifications.items():
         plan_id = data['plan']
         plan_name = config.PLANS[plan_id]['name'] if plan_id in config.PLANS else plan_id
+        text += f"👤 Name: {user_data.get('first_name', 'N/A')}\n"
         text += f"👤 ID: <code>{uid}</code>\n"
         text += f"📅 Plan: {plan_name}\n"
         text += f"💰 Amount: ₹{data['amount']}\n"
