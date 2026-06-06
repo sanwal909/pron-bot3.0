@@ -12,7 +12,8 @@ load_dotenv(override=True)
 
 # ============ CONFIG FROM ENVIRONMENT ============
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip('"')
-ADMIN_ID = os.getenv("ADMIN_ID", "").strip('"')
+ADMIN_IDS_ENV = [id.strip() for id in os.getenv("ADMIN_IDS", os.getenv("ADMIN_ID", "")).split(",") if id.strip()]
+ADMIN_ID = ADMIN_IDS_ENV[0] if ADMIN_IDS_ENV else ""
 LOG_CHANNEL = os.getenv("LOG_CHANNEL", "").strip('"')
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "").strip('"')
 DEMO_CHANNEL_LINK = os.getenv("DEMO_CHANNEL_LINK", "").strip('"')
@@ -97,7 +98,8 @@ def force_migrate_to_mongodb():
         "pending_verifications": PENDING_VERIF_FILE,
         "invite_links": INVITE_LINKS_FILE,
         "settings": SETTINGS_FILE,
-        "join_requests": JOIN_REQUESTS_FILE
+        "join_requests": JOIN_REQUESTS_FILE,
+        "sales_data": SALES_DATA_FILE
     }
     
     migrated = []
@@ -129,9 +131,11 @@ PENDING_VERIF_FILE = os.path.join(DATA_DIR, "pending_verifications.json")
 INVITE_LINKS_FILE = os.path.join(DATA_DIR, "invite_links.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 JOIN_REQUESTS_FILE = os.path.join(DATA_DIR, "join_requests.json")
+SALES_DATA_FILE = os.path.join(DATA_DIR, "sales_data.json")
 
 # ============ DEFAULT SETTINGS ============
 DEFAULT_SETTINGS = {
+    "admin_ids": ADMIN_IDS_ENV,
     "log_channel": LOG_CHANNEL,
     "support_username": SUPPORT_USERNAME,
     "demo_channel_link": DEMO_CHANNEL_LINK,
@@ -149,15 +153,9 @@ DEFAULT_SETTINGS = {
     "payment_proof_link": "", # New: Payment proof channel link
     "payment_proof_status": True, # Enabled by default now
     "how_to_buy_url": "", # New: How to buy tutorial/guide URL
+    "total_orders": 0, # New: Sequential order counter
     "premium_channels": [
-        {"id": "ch1", "name": "Channel 1", "amount": "99", "channel_id": "", "duration": "30 Days"},
-        {"id": "ch2", "name": "Channel 2", "amount": "99", "channel_id": "", "duration": "30 Days"},
-        {"id": "ch3", "name": "Channel 3", "amount": "99", "channel_id": "", "duration": "30 Days"},
-        {"id": "ch4", "name": "Channel 4", "amount": "99", "channel_id": "", "duration": "30 Days"},
-        {"id": "ch5", "name": "Channel 5", "amount": "99", "channel_id": "", "duration": "30 Days"},
-        {"id": "ch6", "name": "Channel 6", "amount": "99", "channel_id": "", "duration": "30 Days"},
-        {"id": "ch7", "name": "Channel 7", "amount": "99", "channel_id": "", "duration": "30 Days"},
-        {"id": "all", "name": "All Channels", "amount": "299", "channel_ids": [], "duration": "30 Days"}
+        {"id": "ch1", "name": "Channel 1", "amount": "99", "channel_id": "", "duration": "30 Days"}
     ]
 }
 
@@ -214,6 +212,7 @@ spam_data = load_json_file(SPAM_DATA_FILE, {})
 start_message_data = load_json_file(START_MESSAGE_FILE, {})
 pending_verifications = load_json_file(PENDING_VERIF_FILE, {})
 join_requests = load_json_file(JOIN_REQUESTS_FILE, []) # List of user IDs
+sales_data = load_json_file(SALES_DATA_FILE, []) # List of sale records
 
 # FIXED: Load invite_links and ensure all values are LISTS
 invite_links = load_json_file(INVITE_LINKS_FILE, {})
@@ -286,6 +285,7 @@ def save_all_data():
     save_json_file(INVITE_LINKS_FILE, invite_links)
     save_json_file(SETTINGS_FILE, settings)
     save_json_file(JOIN_REQUESTS_FILE, join_requests)
+    save_json_file(SALES_DATA_FILE, sales_data)
     print("💾 All data saved")
 
 # Initialize spam data for existing users
