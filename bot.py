@@ -17,7 +17,9 @@ from config import *
 from verif import init_verification
 
 # Initialize bot
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+# Use config.BOT_TOKEN to avoid NameError if star import hasn't processed it yet
+_token = getattr(config, 'BOT_TOKEN', os.getenv("BOT_TOKEN", ""))
+bot = telebot.TeleBot(_token, parse_mode="HTML")
 
 # Initialize verification system
 verif = init_verification(bot)
