@@ -1,488 +1,309 @@
-import telebot
-from telebot import types
+import json
+import os
 import time
-import threading
 from datetime import datetime, timedelta
 import logging
+from dotenv import load_dotenv
+from pymongo import MongoClient
+import urllib.parse
 
-# Import config FIRST
-import config
-from config import *
+# Load environment variables from .env file
+load_dotenv(override=True)
 
-logger = logging.getLogger(__name__)
+# ============ CONFIG FROM ENVIRONMENT ============
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip('"')
+ADMIN_IDS_ENV = [id.strip() for id in os.getenv("ADMIN_IDS", os.getenv("ADMIN_ID", "")).split(",") if id.strip()]
+ADMIN_ID = ADMIN_IDS_ENV[0] if ADMIN_IDS_ENV else ""
+LOG_CHANNEL = os.getenv("LOG_CHANNEL", "").strip('"')
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "").strip('"')
+DEMO_CHANNEL_LINK = os.getenv("DEMO_CHANNEL_LINK", "").strip('"')
+UPI_ID = os.getenv("UPI_ID", "").strip('"')
+UPI_NAME = os.getenv("UPI_NAME", "").strip('"')
+MONGO_URI = os.getenv("MONGO_URI", "").strip('"')
 
-class VerificationSystem:
-    def __init__(self, bot):
-        self.bot = bot
-        self.pending = pending_verifications
-    
-    def save_pending(self):
-        """Save pending verifications"""
-        # save_json_file(PENDING_VERIF_FILE, self.pending) # Removed for batch saving
-        pass
-    
-    def create_invite_link(self, user_id, plan_type):
-        """Create unique invite link(s) for specific channel(s) based on plan"""
-        global invite_links
+# Spam protection settings
+MAX_SPAM_COUNT = int(os.environ.get("MAX_SPAM_COUNT", "5"))
+SPAM_TIME_WINDOW = int(os.environ.get("SPAM_TIME_WINDOW", "10"))
+WARNING_MESSAGES = ["⚠️ Please don't spam!", "⚠️ This is your last warning!", "⛔ You are being blocked for spamming!"]
+BLOCK_DURATIONS = [300, 900, 1800]  # 5min, 15min, 30min (seconds)
+
+# ============ MONGO DB SETUP ============
+db = None
+if MONGO_URI:
+    try:
+        # Check if password needs quoting (common for Mongo Atlas)
+        if "://" in MONGO_URI and "@" in MONGO_URI:
+            prefix = MONGO_URI.split("://")[0]
+            rest = MONGO_URI.split("://")[1]
+            
+            # Find the LAST '@' which separates userinfo from host
+            last_at_idx = rest.rfind("@")
+            if last_at_idx != -1:
+                user_pass = rest[:last_at_idx]
+                host_rest = rest[last_at_idx+1:]
+                
+                if ":" in user_pass:
+                    user = user_pass.split(":")[0]
+                    password = user_pass[len(user)+1:] # Get everything after the first ':'
+                    # Quote password only
+                    encoded_pass = urllib.parse.quote_plus(password)
+                    MONGO_URI = f"{prefix}://{user}:{encoded_pass}@{host_rest}"
+
+        client = MongoClient(MONGO_URI)
+        db = client['PremiumBot']
+        # Test connection
+        client.admin.command('ping')
+        print("✅ MongoDB Connected Successfully!")
+    except Exception as e:
+        print(f"❌ MongoDB Connection Error: {e}")
+        logging.error(f"MongoDB Connection Error: {e}")
+
+def get_collection(name):
+    if db is not None:
+        return db[name]
+    return None
+
+def db_save(collection_name, data):
+    col = get_collection(collection_name)
+    if col is not None:
         try:
-            plan = config.PLANS[plan_type]
-            
-            # Special case for "all" channels
-            if plan_type == "all":
-                channel_ids = plan.get('channel_ids', [])
-                valid_links = []
-                for idx, cid in enumerate(channel_ids, 1):
-                    if not cid: continue
-                    try:
-                        invite = self.bot.create_chat_invite_link(
-                            chat_id=int(cid),
-                            member_limit=2,
-                            expire_date=datetime.now() + timedelta(days=365)
-                        )
-                        valid_links.append(f"Channel {idx}: {invite.invite_link}")
-                    except Exception as e:
-                        logger.error(f"Error creating invite for {cid}: {e}")
-                
-                if not valid_links:
-                    return "Error: No channel IDs configured for All Channels. Contact admin."
-                
-                # Store links
-                user_id_str = str(user_id)
-                if user_id_str not in invite_links:
-                    invite_links[user_id_str] = []
-                
-                link_data = {
-                    'plan': plan_type,
-                    'links': valid_links,
-                    'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                invite_links[user_id_str].append(link_data)
-                # save_json_file(INVITE_LINKS_FILE, invite_links) # Removed for batch saving
-                
-                return "\n".join(valid_links)
-
-            # Standard case for single channel
-            channel_id = plan.get('channel_id', '')
-            if not channel_id:
-                # Special fallback for demo if ID is missing but link exists
-                if plan_type == "demo" and settings.get('demo_channel_link'):
-                    return settings.get('demo_channel_link')
-                return f"Error: Channel ID not configured for {plan['name']}. Contact admin."
-            
-            expire_date = datetime.now() + timedelta(days=365)
-            invite = self.bot.create_chat_invite_link(
-                chat_id=int(channel_id),
-                member_limit=2,
-                expire_date=expire_date
-            )
-            
-            user_id_str = str(user_id)
-            if user_id_str not in invite_links:
-                invite_links[user_id_str] = []
-            
-            invite_links[user_id_str].append({
-                'plan': plan_type,
-                'link': invite.invite_link,
-                'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
-            # save_json_file(INVITE_LINKS_FILE, invite_links) # Removed for batch saving
-            
-            return invite.invite_link
-        except Exception as e:
-            logger.error(f"Invite Link Error: {e}")
-            return f"Error creating link: {str(e)}"
-
-    def plan_selection_keyboard(self):
-        """Dynamic Membership keyboard"""
-        keyboard = types.InlineKeyboardMarkup(row_width=1)
-        
-        channels = settings.get("premium_channels", [])
-        for ch in channels:
-            keyboard.add(types.InlineKeyboardButton(f"🔗 {ch['name']} - ₹{ch['amount']}", callback_data=f"plan_{ch['id']}"))
-            
-        keyboard.add(types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="main_menu"))
-        return keyboard
-
-    def main_menu_keyboard(self):
-        """Main menu with 3 main buttons"""
-        keyboard = types.InlineKeyboardMarkup(row_width=1)
-        
-        # 1. Premium Demo
-        is_paid = settings.get('demo_paid_status', False)
-        demo_amount = settings.get('demo_amount', '10')
-        demo_link = settings.get('demo_channel_link', '')
-        
-        if is_paid:
-            keyboard.add(types.InlineKeyboardButton(f"📢 Premium Demo (₹{demo_amount})", callback_data="plan_demo"))
-        elif demo_link:
-            keyboard.add(types.InlineKeyboardButton("📢 Premium Demo", url=demo_link))
-        else:
-            keyboard.add(types.InlineKeyboardButton("📢 Premium Demo (Not Set)", callback_data="demo_not_set"))
-            
-        # 2. Get Membership
-        keyboard.add(types.InlineKeyboardButton("💰 Get Membership", callback_data="get_membership"))
-        
-        # 3. How To Buy
-        how_to_buy_url = settings.get('how_to_buy_url', '')
-        if how_to_buy_url:
-            keyboard.add(types.InlineKeyboardButton("❓ How To Buy", url=how_to_buy_url))
-        else:
-            keyboard.add(types.InlineKeyboardButton("❓ How To Buy", callback_data="how_to_get"))
-        
-        # 4. Payment Proof Channel
-        if settings.get("payment_proof_status", True):
-            proof_link = settings.get('payment_proof_link', '')
-            if proof_link:
-                keyboard.add(types.InlineKeyboardButton("🧾 Payment Proofs", url=proof_link))
-            else:
-                keyboard.add(types.InlineKeyboardButton("🧾 Payment Proofs (Not Set)", callback_data="proof_not_set"))
-
-        # Optional: Support Button
-        if settings.get("support_button_status", True):
-            support_user = settings.get('support_username', '')
-            if support_user:
-                keyboard.add(types.InlineKeyboardButton("📞 Support", url=f"https://t.me/{support_user}"))
-            else:
-                keyboard.add(types.InlineKeyboardButton("📞 Support (Not Set)", callback_data="support_not_set"))
-        
-        return keyboard
-    
-    def ask_for_screenshot(self, chat_id, user_id, plan_type):
-        """Ask user to send payment screenshot"""
-        plan = config.PLANS[plan_type]
-        pending_data = self.pending.get(str(user_id), {})
-        order_num = pending_data.get('order_number', 'N/A')
-        
-        msg = self.bot.send_message(
-            chat_id,
-            f"""
-<b>📸 SEND PAYMENT SCREENSHOT (Order #{order_num})</b>
-
-<b>Plan Selected:</b> {plan['name']}
-<b>Amount to Pay:</b> ₹{plan['amount']}
-<b>UPI ID:</b> <code>{settings['upi_id']}</code>
-
-✅ <b>Payment Done!</b>
-
-Now please send the <b>payment screenshot</b> for verification.
-
-<b>Instructions:</b>
-1. Take screenshot of UPI payment
-2. Send it here as photo
-3. Admin will verify within few minutes
-4. You'll receive unique join link after verification
-
-⏳ <i>Please wait for admin verification...</i>
-            """,
-            parse_mode="HTML"
-        )
-        return msg
-    
-    def handle_screenshot(self, message):
-        """Handle payment screenshot from user"""
-        user_id = str(message.from_user.id)
-        
-        # Check if user has pending verification
-        if user_id not in self.pending:
-            return False
-        
-        if not message.photo:
-            self.bot.reply_to(
-                message,
-                "❌ Please send a PHOTO (screenshot) of your payment."
-            )
+            # We store everything as one document with _id: "main_data" for simple key-value structures
+            # or as separate documents for users. To keep it compatible with current dict structure:
+            col.replace_one({"_id": "main_data"}, {"_id": "main_data", "data": data}, upsert=True)
             return True
-        
-        pending_data = self.pending[user_id]
-        plan_type = pending_data['plan']
-        plan = config.PLANS[plan_type]
-        
-        # Get the largest photo
-        photo = message.photo[-1]
-        file_id = photo.file_id
-        
-        # Store screenshot info
-        pending_data['screenshot_file_id'] = file_id
-        pending_data['screenshot_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        pending_data['screenshot_msg_id'] = message.message_id
-        self.save_pending()
-        
-        # Create verification buttons for admin
-        keyboard = types.InlineKeyboardMarkup(row_width=2)
-        verify_btn = types.InlineKeyboardButton(
-            "✅ Verify Payment", 
-            callback_data=f"verify_{user_id}"
-        )
-        reject_btn = types.InlineKeyboardButton(
-            "❌ Reject", 
-            callback_data=f"reject_{user_id}"
-        )
-        keyboard.add(verify_btn, reject_btn)
-        
-        # Forward screenshot to admin log channel
-        order_num = pending_data.get('order_number', 'N/A')
-        caption = f"""
-📸 <b>PAYMENT SCREENSHOT RECEIVED (Order #{order_num})</b>
-
-👤 User: @{message.from_user.username or 'N/A'}
-🆔 User ID: <code>{user_id}</code>
-📅 Plan: {plan['name']}
-💰 Amount: ₹{plan['amount']}
-⏰ Time: {pending_data['screenshot_time']}
-
-<b>Verify payment and send join link:</b>
-        """
-        
-        try:
-            # Send screenshot to log channel or fallback to first Admin ID
-            target_chat = settings.get('log_channel')
-            
-            # Check if bot can send to target_chat
-            try:
-                sent_msg = self.bot.send_photo(
-                    target_chat,
-                    photo=file_id,
-                    caption=caption,
-                    reply_markup=keyboard,
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                # If log channel fails, try primary admin
-                if "Forbidden" in str(e) or "chat not found" in str(e).lower():
-                    primary_admin = settings['admin_ids'][0] if settings.get('admin_ids') else None
-                    if primary_admin and str(primary_admin) != str(target_chat):
-                        sent_msg = self.bot.send_photo(
-                            primary_admin,
-                            photo=file_id,
-                            caption=caption + "\n\n⚠️ <i>(Log channel forbidden/not found, sent to admin)</i>",
-                            reply_markup=keyboard,
-                            parse_mode="HTML"
-                        )
-                    else:
-                        raise e
-                else:
-                    raise e
-            
-            # Store admin message ID
-            pending_data['admin_msg_id'] = sent_msg.message_id
-            pending_data['admin_chat_id'] = sent_msg.chat.id
-            self.save_pending()
-            
-            # Notify user
-            self.bot.reply_to(
-                message,
-                f"""
-✅ <b>Screenshot received!</b>
-
-Admin will verify your payment soon.
-You'll receive unique join link within few minutes.
-
-⏳ <i>Thank you for your patience!</i>
-                """,
-                parse_mode="HTML"
-            )
-            
         except Exception as e:
-            logger.error(f"Error forwarding screenshot: {e}")
-            self.bot.reply_to(
-                message,
-                f"❌ Error sending screenshot. Please contact @{settings['support_username']}"
-            )
-        
-        return True
-    
-    def verify_payment(self, user_id, admin_id):
-        """Verify payment and send unique invite link"""
-        user_id = str(user_id)
-        
-        if user_id not in self.pending:
-            return False, "User not found in pending verifications"
-        
-        pending_data = self.pending[user_id]
-        plan_type = pending_data['plan']
-        plan = config.PLANS[plan_type]
-        
-        # Create unique invite link for specific channel
-        invite_link = self.create_invite_link(user_id, plan_type)
-        
-        # Check if link creation failed
-        if "Error" in invite_link:
-            return False, invite_link
-        
-        # Send join link to user
+            logging.error(f"DB Save Error ({collection_name}): {e}")
+    return False
+
+def db_load(collection_name, default=None):
+    col = get_collection(collection_name)
+    if col is not None:
         try:
-            if plan_type == "demo":
-                join_msg = f"""
-🎉 <b>DEMO ACCESS VERIFIED!</b>
-
-<b>Plan:</b> {plan['name']}
-<b>Amount Paid:</b> ₹{plan['amount']}
-
-<b>👇 Your Unique Demo Invite Link (2 Uses):</b>
-{invite_link}
-
-⚠️ <b>Note:</b> This link can be used up to 2 TIMES.
-📅 <b>Access Duration:</b> {plan.get('duration', '30 Days')}
-
-<b>Enjoy your demo! 🍿</b>
-                """
-            else:
-                join_msg = f"""
-🎉 <b>PAYMENT VERIFIED SUCCESSFULLY!</b>
-
-<b>Plan:</b> {plan['name']}
-<b>Amount Paid:</b> ₹{plan['amount']}
-
-<b>👇 Your Unique Invite Link (2 Uses):</b>
-{invite_link}
-
-⚠️ <b>Note:</b> This link can be used up to 2 TIMES and is personal to you.
-📅 <b>Access Duration:</b> {plan.get('duration', '30 Days')}
-
-<b>Welcome to Premium Family! 🎊</b>
-                """
-            
-            self.bot.send_message(
-                int(user_id),
-                join_msg,
-                parse_mode="HTML"
-            )
-            
-            # Log verification
-            order_num = pending_data.get('order_number', 'N/A')
-            log_msg = f"""
-✅ <b>PAYMENT VERIFIED (Order #{order_num})</b>
-
-👤 User ID: <code>{user_id}</code>
-📅 Plan: {plan['name']}
-💰 Amount: ₹{plan['amount']}
-👮 Verified By: Admin
-🔗 Invite Link: {invite_link}
-⏰ Time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-            """
-            
-            target_chat = settings.get('log_channel')
-            try:
-                if target_chat:
-                    self.bot.send_message(
-                        target_chat,
-                        log_msg,
-                        parse_mode="HTML"
-                    )
-            except Exception as e:
-                logger.error(f"Log channel error: {e}")
-                # Fallback to admin if log channel fails
-                primary_admin = settings['admin_ids'][0] if settings.get('admin_ids') else None
-                if primary_admin and str(primary_admin) != str(target_chat):
-                    try:
-                        self.bot.send_message(
-                            primary_admin,
-                            log_msg + "\n\n⚠️ <i>(Log channel failed)</i>",
-                            parse_mode="HTML"
-                        )
-                    except:
-                        pass
-            
-            # Record Sale
-            sale_record = {
-                'order_number': order_num,
-                'user_id': user_id,
-                'plan_type': plan_type,
-                'plan_name': plan['name'],
-                'amount': float(plan['amount']),
-                'upi_id': settings.get('upi_id', 'Unknown'),
-                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'date': datetime.now().strftime("%Y-%m-%d"),
-                'admin_id': admin_id
-            }
-            sales_data.append(sale_record)
-            
-            # Update user data to mark as premium
-            if user_id in users_data:
-                users_data[user_id]['is_premium'] = True
-                users_data[user_id]['premium_plan'] = plan_type
-                users_data[user_id]['premium_until'] = (
-                    "lifetime" if plan_type == "lifetime" 
-                    else (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
-                )
-                users_data[user_id]['invite_link'] = invite_link
-                # save_users_data() # Removed for batch saving
-            
-            # Remove from pending
-            del self.pending[user_id]
-            self.save_pending()
-            
-            return True, "User verified and unique join link sent"
-            
+            doc = col.find_one({"_id": "main_data"})
+            if doc:
+                return doc.get("data", default)
         except Exception as e:
-            logger.error(f"Error sending join link: {e}")
-            return False, f"Error sending message: {str(e)}"
+            logging.error(f"DB Load Error ({collection_name}): {e}")
+    return None # Return None if not found in DB
+
+def force_migrate_to_mongodb():
+    """Force upload all local JSON files to MongoDB"""
+    if db is None:
+        return False, "MongoDB not connected"
+        
+    files = {
+        "users_data": USERS_DATA_FILE,
+        "spam_data": SPAM_DATA_FILE,
+        "start_message": START_MESSAGE_FILE,
+        "pending_verifications": PENDING_VERIF_FILE,
+        "invite_links": INVITE_LINKS_FILE,
+        "settings": SETTINGS_FILE,
+        "join_requests": JOIN_REQUESTS_FILE,
+        "sales_data": SALES_DATA_FILE
+    }
     
-    def reject_payment(self, user_id, admin_id):
-        """Reject payment and notify user"""
-        user_id = str(user_id)
-        
-        if user_id not in self.pending:
-            return False, "User not found in pending verifications"
-        
-        pending_data = self.pending[user_id]
-        
-        # Notify user
-        try:
-            reject_msg = f"""
-❌ <b>PAYMENT VERIFICATION FAILED</b>
-
-Your payment screenshot could not be verified.
-
-<b>Possible reasons:</b>
-• Screenshot not clear
-• Wrong amount paid
-• Payment not received
-
-<b>Please try again or contact support:</b>
-📞 @{settings['support_username']}
-            """
-            
-            self.bot.send_message(
-                int(user_id),
-                reject_msg,
-                parse_mode="HTML"
-            )
-            
-            # Log rejection
-            log_msg = f"""
-❌ <b>PAYMENT REJECTED</b>
-
-👤 User ID: <code>{user_id}</code>
-👮 Rejected By: Admin
-⏰ Time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-            """
-            
-            target_chat = settings.get('log_channel')
-            if not target_chat:
-                target_chat = settings['admin_ids'][0] if settings.get('admin_ids') else None
+    migrated = []
+    for name, path in files.items():
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if data:
+                        db_save(name, data)
+                        migrated.append(name)
+            except Exception as e:
+                logging.error(f"Migration error for {name}: {e}")
                 
-            if target_chat:
-                self.bot.send_message(
-                    target_chat,
-                    log_msg,
-                    parse_mode="HTML"
-                )
-            
-            # Remove from pending
-            del self.pending[user_id]
-            self.save_pending()
-            
-            return True, "Payment rejected and user notified"
-            
-        except Exception as e:
-            logger.error(f"Error rejecting payment: {e}")
-            return False, f"Error: {str(e)}"
+    return True, migrated
 
-# Initialize verification system
-verification = None
+# ============ DATA DIRECTORY ============
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    print(f"✅ Created data directory: {DATA_DIR}")
 
-def init_verification(bot_instance):
-    global verification
-    verification = VerificationSystem(bot_instance)
-    return verification
+# Data files
+USERS_DATA_FILE = os.path.join(DATA_DIR, "users_data.json")
+SPAM_DATA_FILE = os.path.join(DATA_DIR, "spam_data.json")
+START_MESSAGE_FILE = os.path.join(DATA_DIR, "start_message.json")
+PENDING_VERIF_FILE = os.path.join(DATA_DIR, "pending_verifications.json")
+INVITE_LINKS_FILE = os.path.join(DATA_DIR, "invite_links.json")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+JOIN_REQUESTS_FILE = os.path.join(DATA_DIR, "join_requests.json")
+SALES_DATA_FILE = os.path.join(DATA_DIR, "sales_data.json")
+
+# ============ DEFAULT SETTINGS ============
+DEFAULT_SETTINGS = {
+    "admin_ids": ADMIN_IDS_ENV,
+    "log_channel": LOG_CHANNEL,
+    "support_username": SUPPORT_USERNAME,
+    "demo_channel_link": DEMO_CHANNEL_LINK,
+    "upi_id": UPI_ID,
+    "upi_name": UPI_NAME,
+    "demo_channel_id": "",
+    "membership_channels": [],
+    "force_request_channel": "", # New field for request join
+    "force_request_msg": "<b>✅ Join Request Received!</b>\n\nYour request has been received. Please wait for admin to accept, or you can start using the bot now if you have already sent the request.",
+    "force_join_status": True, # New: Toggle for force join system
+    "auto_accept_requests": False, # New: Auto-accept join requests
+    "demo_paid_status": False,
+    "demo_amount": "10",
+    "support_button_status": True,
+    "payment_proof_link": "", # New: Payment proof channel link
+    "payment_proof_status": True, # Enabled by default now
+    "how_to_buy_url": "", # New: How to buy tutorial/guide URL
+    "total_orders": 0, # New: Sequential order counter
+    "premium_channels": [
+        {"id": "ch1", "name": "Channel 1", "amount": "99", "channel_id": "", "duration": "30 Days"}
+    ]
+}
+
+# ============ DATA LOAD/SAVE FUNCTIONS ============
+def load_json_file(filepath, default=None):
+    """Load from MongoDB first, then fallback to JSON file"""
+    if default is None:
+        default = {}
+    
+    filename = os.path.basename(filepath).replace(".json", "")
+    
+    # 1. Try loading from MongoDB
+    db_data = db_load(filename)
+    if db_data is not None:
+        return db_data
+        
+    # 2. If not in DB, try loading from local JSON
+    try:
+        if os.path.exists(filepath):
+            with open(filepath, 'r') as f:
+                data = json.load(f)
+                # Migration: Save this local data to MongoDB
+                db_save(filename, data)
+                return data
+        else:
+            # Create default file and save to DB
+            with open(filepath, 'w') as f:
+                json.dump(default, f)
+            db_save(filename, default)
+            return default
+    except Exception as e:
+        logging.error(f"Error loading {filepath}: {e}")
+        return default
+
+def save_json_file(filepath, data):
+    """Save to both local JSON and MongoDB"""
+    filename = os.path.basename(filepath).replace(".json", "")
+    
+    # 1. Save to MongoDB
+    db_save(filename, data)
+    
+    # 2. Save to local JSON (as backup)
+    try:
+        with open(filepath, 'w') as f:
+            json.dump(data, f, indent=4)
+        return True
+    except Exception as e:
+        logging.error(f"Error saving {filepath}: {e}")
+        return False
+
+# ============ LOAD ALL DATA ============
+users_data = load_json_file(USERS_DATA_FILE, {})
+spam_data = load_json_file(SPAM_DATA_FILE, {})
+start_message_data = load_json_file(START_MESSAGE_FILE, {})
+pending_verifications = load_json_file(PENDING_VERIF_FILE, {})
+join_requests = load_json_file(JOIN_REQUESTS_FILE, []) # List of user IDs
+sales_data = load_json_file(SALES_DATA_FILE, []) # List of sale records
+
+# FIXED: Load invite_links and ensure all values are LISTS
+invite_links = load_json_file(INVITE_LINKS_FILE, {})
+for user_id in invite_links:
+    if not isinstance(invite_links[user_id], list):
+        # If it's not a list, convert to list or create new list
+        if isinstance(invite_links[user_id], dict):
+            # Old format - convert dict to list with one item
+            old_data = invite_links[user_id]
+            invite_links[user_id] = [old_data]
+        else:
+            # Unknown format - create empty list
+            invite_links[user_id] = []
+
+settings = load_json_file(SETTINGS_FILE, DEFAULT_SETTINGS)
+
+# Migration: Ensure premium_channels exists in settings
+if 'premium_channels' not in settings:
+    settings['premium_channels'] = DEFAULT_SETTINGS['premium_channels']
+    save_json_file(SETTINGS_FILE, settings)
+
+# Update PLANS with settings
+def get_plans():
+    plans = {}
+    
+    # Standard channels from settings
+    for ch in settings.get("premium_channels", []):
+        # Ensure duration exists to avoid KeyErrors
+        if 'duration' not in ch:
+            ch['duration'] = "30 Days"
+        plans[ch['id']] = ch
+        
+    # Add demo plan separately
+    plans["demo"] = {
+        "name": "Premium Demo Link",
+        "amount": settings.get("demo_amount", "10"),
+        "duration": "Lifetime",
+        "channel_id": settings.get("demo_channel_id", "")
+    }
+    return plans
+
+PLANS = get_plans()
+
+# Individual save functions
+def save_users_data():
+    """Save users data"""
+    save_json_file(USERS_DATA_FILE, users_data)
+
+def save_spam_data():
+    """Save spam data"""
+    save_json_file(SPAM_DATA_FILE, spam_data)
+
+def save_start_message():
+    """Save start message"""
+    save_json_file(START_MESSAGE_FILE, start_message_data)
+
+def save_settings():
+    """Save settings"""
+    save_json_file(SETTINGS_FILE, settings)
+    # Update PLANS with new settings
+    global PLANS
+    PLANS = get_plans()
+
+def save_all_data():
+    """Save all data at once"""
+    save_json_file(USERS_DATA_FILE, users_data)
+    save_json_file(SPAM_DATA_FILE, spam_data)
+    save_json_file(START_MESSAGE_FILE, start_message_data)
+    save_json_file(PENDING_VERIF_FILE, pending_verifications)
+    save_json_file(INVITE_LINKS_FILE, invite_links)
+    save_json_file(SETTINGS_FILE, settings)
+    save_json_file(JOIN_REQUESTS_FILE, join_requests)
+    save_json_file(SALES_DATA_FILE, sales_data)
+    print("💾 All data saved")
+
+# Initialize spam data for existing users
+def initialize_spam_data():
+    """Ensure all existing users have spam_data entries"""
+    initialized = 0
+    for user_id_str in users_data.keys():
+        if user_id_str not in spam_data:
+            spam_data[user_id_str] = {
+                "requests": [],
+                "warnings": 0,
+                "blocked_until": 0,
+                "block_level": 0,
+                "ban_reason": "",
+                "banned_by": 0
+            }
+            initialized += 1
+    if initialized > 0:
+        print(f"✅ Initialized spam data for {initialized} users")
+
+initialize_spam_data()
