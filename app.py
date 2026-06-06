@@ -3,12 +3,19 @@ from flask import Flask, request
 import threading
 import os
 
+import logging
+
 # Flask app for Railway web service
 app = Flask(__name__)
 
+# Clean logs: Set Flask and Werkzeug to WARNING only
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.WARNING)
+app.logger.setLevel(logging.WARNING)
+
 # Run bot in background thread
 def run_bot():
-    bot.infinity_polling()
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
 
 thread = threading.Thread(target=run_bot, daemon=True)
 thread.start()
