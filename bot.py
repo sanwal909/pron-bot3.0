@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import telebot
 from telebot import types
 import qrcode
@@ -9,9 +10,6 @@ from io import BytesIO
 import json
 import os
 import sys
-import requests
-import shlex
-from flask import Flask
 
 # Import config and verification
 import config
@@ -24,34 +22,55 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 # Initialize verification system
 verif = init_verification(bot)
 
+def is_admin(user_id):
+    """Check if a user is an admin"""
+    admin_ids = settings.get('admin_ids', [])
+    
+    # Sync admins from .env into settings if needed
+    changed = False
+    for env_id in ADMIN_IDS_ENV:
+        if str(env_id) not in [str(aid) for aid in admin_ids]:
+            admin_ids.append(str(env_id))
+            changed = True
+            
+    if changed:
+        settings['admin_ids'] = admin_ids
+        save_settings()
+        
+    # Convert all to strings for comparison
+    return str(user_id) in [str(aid) for aid in admin_ids]
+
 # Setup logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
 # Auto-save thread
 def auto_save_data():
     while True:
-        time.sleep(30)
+        time.sleep(300)
         save_all_data()
 
 auto_save_thread = threading.Thread(target=auto_save_data, daemon=True)
 auto_save_thread.start()
 
-# Flask App for Railway Health Check
-app = Flask(__name__)
-
-@app.route('/')
-def health_check():
-    return "Bot is running!", 200
-
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
-
-flask_thread = threading.Thread(target=run_flask, daemon=True)
-flask_thread.start()
+def delete_message_after_delay(chat_id, message_id, delay=300, send_timeout_msg=False):
+    """Delete a message after a specified delay and optionally send a timeout message"""
+    def delete():
+        try:
+            bot.delete_message(chat_id, message_id)
+            if send_timeout_msg:
+                bot.send_message(
+                    chat_id, 
+                    "<b>⏰ Session Timed Out!</b>\n\nThe payment QR code has been deleted for security. Please use /start to generate a new one.",
+                    parse_mode="HTML"
+                )
+        except Exception as e:
+            # Silently fail if message already deleted
+            pass
+            
+    threading.Timer(delay, delete).start()
 
 def initialize_spam_data():
     """Ensure all existing users have spam_data entries"""
@@ -68,7 +87,7 @@ def initialize_spam_data():
             }
             initialized += 1
     if initialized > 0:
-        print(f"✅ Initialized spam data for {initialized} users")
+        print(f"Initialized spam data for {initialized} users")
 
 # ========== FORCE JOIN REQUEST HANDLER ==========
 @bot.chat_join_request_handler()
@@ -95,7 +114,7 @@ def handle_join_request(message):
         # 2. STANDARD FLOW (If auto-accept is off or failed)
         if user_id not in join_requests:
             join_requests.append(user_id)
-            save_json_file(JOIN_REQUESTS_FILE, join_requests)
+            # save_json_file(JOIN_REQUESTS_FILE, join_requests) # Removed for batch saving
             
         msg_text = settings.get('force_request_msg', "<b>✅ Request Received!</b>")
         try:
@@ -122,7 +141,7 @@ def handle_chat_member_update(message):
             # User joined! Remove from pending requests list
             if user_id in join_requests:
                 join_requests.remove(user_id)
-                save_json_file(JOIN_REQUESTS_FILE, join_requests)
+                # save_json_file(JOIN_REQUESTS_FILE, join_requests) # Removed for batch saving
                 logging.info(f"User {user_id} joined channel, removed from join_requests.")
                 
                 # AUTO-WELCOME MESSAGE
@@ -172,7 +191,7 @@ def is_user_member(user_id):
             # If they are already a member, make sure they aren't in the pending list anymore
             if user_id in join_requests:
                 join_requests.remove(user_id)
-                save_json_file(JOIN_REQUESTS_FILE, join_requests)
+                # save_json_file(JOIN_REQUESTS_FILE, join_requests) # Removed for batch saving
             return True
         
         return False
@@ -311,7 +330,11 @@ def check_spam(user_id):
 ⏰ Duration: {block_duration//60} minutes
 🔢 Spam Count: {request_count}
             """
-            bot.send_message(ADMIN_ID, admin_msg, parse_mode="HTML")
+            for aid in settings.get('admin_ids', []):
+                try:
+                    bot.send_message(aid, admin_msg, parse_mode="HTML")
+                except:
+                    continue
         except:
             pass
         
@@ -339,7 +362,9 @@ def reset_spam_counter(user_id):
             spam_data[user_id_str]["requests"] = []
             spam_data[user_id_str]["warnings"] = 0
 
-def ban_user(user_id, duration_seconds, reason="", banned_by=ADMIN_ID):
+def ban_user(user_id, duration_seconds, reason="", banned_by=None):
+    if banned_by is None:
+        banned_by = settings.get('admin_ids', [None])[0]
     user_id_str = str(user_id)
     current_time = time.time()
     
@@ -438,9 +463,10 @@ def log_important_event(event_type, user_data=None, plan=None):
         
         target_chat = settings.get('log_channel')
         if not target_chat:
-            target_chat = ADMIN_ID
+            target_chat = settings.get('admin_ids', [None])[0]
             
-        bot.send_message(target_chat, log_msg, parse_mode="HTML")
+        if target_chat:
+            bot.send_message(target_chat, log_msg, parse_mode="HTML")
     except Exception as e:
         logging.error(f"Log error: {e}")
 
@@ -459,19 +485,18 @@ def handle_start(message):
         
         is_new_user = str(user_id) not in users_data
         
-        users_data[str(user_id)] = {
-            'id': user_id,
-            'username': message.from_user.username,
-            'first_name': message.from_user.first_name,
-            'last_name': message.from_user.last_name or "",
-            'start_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'is_premium': False
-        }
+        if is_new_user:
+            users_data[str(user_id)] = {
+                'id': user_id,
+                'username': message.from_user.username,
+                'first_name': message.from_user.first_name,
+                'last_name': message.from_user.last_name or "",
+                'start_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'is_premium': False
+            }
+            log_important_event("new_user", users_data[str(user_id)])
         
         reset_spam_counter(user_id)
-        
-        if is_new_user:
-            log_important_event("new_user", users_data[str(user_id)])
         
         # Check if custom start message exists
         if start_message_data and 'has_media' in start_message_data:
@@ -612,22 +637,39 @@ def handle_plan_selection(call):
     
     reset_spam_counter(user_id)
     
+    # Check if user already has a pending verification
+    if str(user_id) in pending_verifications:
+        existing = pending_verifications[str(user_id)]
+        if 'screenshot_file_id' in existing:
+            bot.answer_callback_query(
+                call.id,
+                "⚠️ You already have a pending verification! Please wait for admin to verify your previous payment.",
+                show_alert=True
+            )
+            return
+
     plan_type = call.data.split('_')[1]  # monthly or lifetime
     plan = config.PLANS[plan_type]
     
+    # Increment total orders for sequential order number
+    settings['total_orders'] = settings.get('total_orders', 0) + 1
+    order_num = settings['total_orders']
+    save_settings()
+
     # Store in pending verifications
     pending_verifications[str(user_id)] = {
         'plan': plan_type,
         'amount': plan['amount'],
+        'order_number': order_num,
         'initiated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         'username': call.from_user.username,
         'first_name': call.from_user.first_name
     }
-    save_json_file(PENDING_VERIF_FILE, pending_verifications)
+    # save_json_file(PENDING_VERIF_FILE, pending_verifications) # Removed for batch saving
     
     # Log payment initiation
     if str(user_id) in users_data:
-        log_important_event("payment_initiated", users_data[str(user_id)], plan['name'])
+        log_important_event("payment_initiated", users_data[str(user_id)], f"{plan['name']} (Order #{order_num})")
     
     # Delete previous message
     try:
@@ -640,7 +682,7 @@ def handle_plan_selection(call):
     
     if qr_image:
         caption = f"""
-<b>💰 PAY ₹{plan['amount']} FOR {plan['name'].upper()}</b>
+<b>💰 ORDER #{order_num}: PAY ₹{plan['amount']} FOR {plan['name'].upper()}</b>
 
 <b>UPI Details:</b>
 └ ID: <code>{settings['upi_id']}</code>
@@ -651,6 +693,8 @@ def handle_plan_selection(call):
 1. Scan QR with any UPI app
 2. Pay ₹{plan['amount']}
 3. Click "✅ Payment Done" below
+
+⏳ <i>This QR will auto-delete in 5 minutes.</i>
         """
         
         keyboard = types.InlineKeyboardMarkup(row_width=1)
@@ -658,16 +702,18 @@ def handle_plan_selection(call):
         btn2 = types.InlineKeyboardButton("📞 Support", url=f"https://t.me/{settings['support_username']}")
         keyboard.add(btn1, btn2)
         
-        bot.send_photo(
+        sent_msg = bot.send_photo(
             chat_id,
             photo=qr_image,
             caption=caption,
             reply_markup=keyboard,
             parse_mode="HTML"
         )
+        # Auto-delete after 5 minutes
+        delete_message_after_delay(chat_id, sent_msg.message_id, 300, send_timeout_msg=True)
     else:
         manual_text = f"""
-<b>💰 PAY ₹{plan['amount']} FOR {plan['name'].upper()}</b>
+<b>💰 ORDER #{order_num}: PAY ₹{plan['amount']} FOR {plan['name'].upper()}</b>
 
 <b>UPI ID:</b> <code>{settings['upi_id']}</code>
 <b>Amount:</b> ₹{plan['amount']}
@@ -675,6 +721,8 @@ def handle_plan_selection(call):
 <b>Steps:</b>
 1. Send ₹{plan['amount']} to above UPI ID
 2. Click "✅ Payment Done" below
+
+⏳ <i>This message will auto-delete in 5 minutes.</i>
         """
         
         keyboard = types.InlineKeyboardMarkup(row_width=1)
@@ -682,12 +730,14 @@ def handle_plan_selection(call):
         btn2 = types.InlineKeyboardButton("📞 Support", url=f"https://t.me/{settings['support_username']}")
         keyboard.add(btn1, btn2)
         
-        bot.send_message(
+        sent_msg = bot.send_message(
             chat_id,
             manual_text,
             reply_markup=keyboard,
             parse_mode="HTML"
         )
+        # Auto-delete after 5 minutes
+        delete_message_after_delay(chat_id, sent_msg.message_id, 300, send_timeout_msg=True)
     
     bot.answer_callback_query(call.id)
 
@@ -834,7 +884,7 @@ def handle_photos(message):
 # ========== VERIFICATION CALLBACKS ==========
 @bot.callback_query_handler(func=lambda call: call.data.startswith('verify_'))
 def handle_verify(call):
-    if str(call.from_user.id) != ADMIN_ID:
+    if not is_admin(call.from_user.id):
         bot.answer_callback_query(call.id, "Admin only!")
         return
     
@@ -860,7 +910,7 @@ def handle_verify(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('reject_'))
 def handle_reject(call):
-    if str(call.from_user.id) != ADMIN_ID:
+    if not is_admin(call.from_user.id):
         bot.answer_callback_query(call.id, "Admin only!")
         return
     
@@ -887,7 +937,7 @@ def handle_reject(call):
 # ========== /VERIFY COMMAND ==========
 @bot.message_handler(commands=['verify'])
 def handle_manual_verify(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     
     args = message.text.split()
@@ -910,17 +960,19 @@ def handle_manual_verify(message):
 # ========== /SETTINGS COMMAND (FIXED HTML) ==========
 @bot.message_handler(commands=['settings'])
 def handle_settings(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     
     # Premium Channels List
     ch_info = ""
     for ch in settings.get('premium_channels', []):
-        ch_info += f"• {ch['id']}: {ch['name']} (₹{ch['amount']}) - <code>{ch['channel_id']}</code>\n"
+        ch_id_display = ch.get('channel_id', ch.get('channel_ids', 'Not Set'))
+        ch_info += f"• {ch.get('id', '??')}: {ch.get('name', 'Unknown')} (₹{ch.get('amount', '0')}) - <code>{ch_id_display}</code>\n"
     
     text = f"""
 <b>⚙️ CURRENT SETTINGS</b>
 
+<b>👑 Admins:</b> <code>{', '.join(settings.get('admin_ids', []))}</code>
 <b>📢 Demo Link:</b> {settings.get('demo_channel_link', 'Not Set')}
 <b>🆔 Demo ID:</b> <code>{settings.get('demo_channel_id', 'Not Set')}</code>
 <b>💰 Demo Price:</b> ₹{settings.get('demo_amount', '10')}
@@ -948,7 +1000,7 @@ def handle_settings(message):
 # ========== /SET COMMAND (FIXED HTML) ==========
 @bot.message_handler(commands=['set'])
 def handle_set(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     
     args = message.text.split(maxsplit=2)
@@ -999,7 +1051,7 @@ def handle_banlist(message):
 @bot.message_handler(commands=['broadcast'])
 def handle_broadcast(message):
     """Broadcast message to all users"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     
     if not message.reply_to_message:
@@ -1077,8 +1129,8 @@ def handle_broadcast(message):
                 
                 sent += 1
                 
-                # Update progress every 10 users
-                if idx % 10 == 0:
+                # Update progress every 50 users
+                if (idx + 1) % 50 == 0:
                     percent = int((idx + 1) / total_users * 100)
                     try:
                         bot.edit_message_text(
@@ -1089,10 +1141,18 @@ def handle_broadcast(message):
                     except:
                         pass
                 
-                time.sleep(0.1)  # Rate limit protection
+                time.sleep(0.05)  # Rate limit protection
                 
             except Exception as e:
                 failed += 1
+                # Auto-remove dead users
+                error_str = str(e).lower()
+                if "forbidden" in error_str or "blocked" in error_str or "deactivated" in error_str:
+                    if user_id_str in users_data:
+                        del users_data[user_id_str]
+        
+        # Save all data after broadcast complete
+        save_all_data()
         
         final_text = f"""
 ✅ <b>BROADCAST COMPLETE!</b>
@@ -1123,7 +1183,7 @@ def handle_broadcast(message):
 @bot.message_handler(commands=['stats'])
 def handle_stats(message):
     """Show bot statistics"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     
     current_time = time.time()
@@ -1169,10 +1229,113 @@ def handle_stats(message):
     """
     bot.reply_to(message, stats_text, parse_mode="HTML")
 
-# ========== ADMIN COMMANDS (NEW) ==========
+# ========== /SALES COMMAND ==========
+@bot.message_handler(commands=['sales'])
+def handle_sales(message):
+    """Show sales statistics (Daily, Weekly, Monthly)"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    week_ago = now - timedelta(days=7)
+    month_ago = now - timedelta(days=30)
+    
+    daily_total = 0
+    weekly_total = 0
+    monthly_total = 0
+    
+    upi_sales = {} # Track sales per UPI ID
+    
+    for sale in sales_data:
+        try:
+            sale_date = datetime.strptime(sale['date'], "%Y-%m-%d")
+            amount = float(sale['amount'])
+            upi = sale.get('upi_id', 'Unknown')
+            
+            if upi not in upi_sales:
+                upi_sales[upi] = 0
+            
+            if sale['date'] == today_str:
+                daily_total += amount
+                upi_sales[upi] += amount
+            
+            if sale_date >= week_ago:
+                weekly_total += amount
+            
+            if sale_date >= month_ago:
+                monthly_total += amount
+        except:
+            continue
+            
+    upi_info = ""
+    for upi, amt in upi_sales.items():
+        upi_info += f"• <code>{upi}</code>: ₹{amt}\n"
+        
+    sales_text = f"""
+<b>💰 SALES STATISTICS</b>
+
+📅 <b>Total Revenue:</b>
+• <b>Daily:</b> ₹{daily_total}
+• <b>Weekly:</b> ₹{weekly_total}
+• <b>Monthly:</b> ₹{monthly_total}
+
+💳 <b>Revenue by UPI (Today):</b>
+{upi_info if upi_info else '• No sales today'}
+
+📊 <b>Total Transactions:</b> {len(sales_data)}
+    """
+    bot.reply_to(message, sales_text, parse_mode="HTML")
+
+# ========== /ADMIN COMMANDS (NEW) ==========
+@bot.message_handler(commands=['add_admin'])
+def handle_add_admin(message):
+    if not is_admin(message.from_user.id):
+        return
+        
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: <code>/add_admin user_id</code>", parse_mode="HTML")
+        return
+        
+    new_admin = args[1].strip()
+    if 'admin_ids' not in settings:
+        settings['admin_ids'] = []
+        
+    if new_admin not in settings['admin_ids']:
+        settings['admin_ids'].append(new_admin)
+        save_settings()
+        bot.reply_to(message, f"✅ User <code>{new_admin}</code> added to admins.", parse_mode="HTML")
+    else:
+        bot.reply_to(message, "User is already an admin.")
+
+@bot.message_handler(commands=['remove_admin'])
+def handle_remove_admin(message):
+    if not is_admin(message.from_user.id):
+        return
+        
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: <code>/remove_admin user_id</code>", parse_mode="HTML")
+        return
+        
+    admin_to_remove = args[1].strip()
+    
+    # Don't allow removing the last admin
+    if len(settings.get('admin_ids', [])) <= 1:
+        bot.reply_to(message, "❌ Cannot remove the last admin.")
+        return
+        
+    if admin_to_remove in settings.get('admin_ids', []):
+        settings['admin_ids'].remove(admin_to_remove)
+        save_settings()
+        bot.reply_to(message, f"✅ User <code>{admin_to_remove}</code> removed from admins.", parse_mode="HTML")
+    else:
+        bot.reply_to(message, "User is not in admin list.")
+
 @bot.message_handler(commands=['add_channel'])
 def handle_add_channel(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
         
     args = message.text.split()
@@ -1192,14 +1355,14 @@ def handle_add_channel(message):
 
 @bot.message_handler(commands=['remove_channel'])
 def handle_remove_channel(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
-        
+
     args = message.text.split()
     if len(args) < 2:
         bot.reply_to(message, "Usage: <code>/remove_channel channel_id</code>", parse_mode="HTML")
         return
-        
+
     channel_id = args[1]
     if channel_id in settings.get('membership_channels', []):
         settings['membership_channels'].remove(channel_id)
@@ -1210,43 +1373,43 @@ def handle_remove_channel(message):
 
 @bot.message_handler(commands=['channels'])
 def handle_channels(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
-        
+
     channels = settings.get('membership_channels', [])
     if not channels:
         bot.reply_to(message, "No membership channels set.")
         return
-        
+
     text = "<b>📢 MEMBERSHIP CHANNELS:</b>\n\n"
     for idx, cid in enumerate(channels, 1):
         text += f"{idx}. <code>{cid}</code>\n"
-        
+
     bot.reply_to(message, text, parse_mode="HTML")
 
 @bot.message_handler(commands=['demo_toggle'])
 def handle_demo_toggle(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
-        
+
     current_status = settings.get('demo_paid_status', False)
     new_status = not current_status
     settings['demo_paid_status'] = new_status
     save_settings()
-    
+
     status_text = "PAID" if new_status else "FREE"
     bot.reply_to(message, f"✅ Demo is now <b>{status_text}</b>.", parse_mode="HTML")
 
 @bot.message_handler(commands=['demo_price'])
 def handle_demo_price(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
-        
+
     args = message.text.split()
     if len(args) < 2:
         bot.reply_to(message, "Usage: <code>/demo_price amount</code>", parse_mode="HTML")
         return
-        
+
     amount = args[1]
     settings['demo_amount'] = amount
     save_settings()
@@ -1254,14 +1417,14 @@ def handle_demo_price(message):
 
 @bot.message_handler(commands=['set_demo_ch'])
 def handle_set_demo_ch(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
-        
+
     args = message.text.split()
     if len(args) < 2:
         bot.reply_to(message, "Usage: <code>/set_demo_ch channel_id</code>", parse_mode="HTML")
         return
-        
+
     ch_id = args[1]
     settings['demo_channel_id'] = ch_id
     save_settings()
@@ -1269,14 +1432,14 @@ def handle_set_demo_ch(message):
 
 @bot.message_handler(commands=['set_demo_link'])
 def handle_set_demo_link(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
-        
+
     args = message.text.split()
     if len(args) < 2:
         bot.reply_to(message, "Usage: <code>/set_demo_link https://t.me/xxx</code>", parse_mode="HTML")
         return
-        
+
     url = args[1]
     settings['demo_channel_link'] = url
     save_settings()
@@ -1284,50 +1447,50 @@ def handle_set_demo_link(message):
 
 @bot.message_handler(commands=['support_toggle'])
 def handle_support_toggle(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
-        
+
     current = settings.get("support_button_status", True)
     settings["support_button_status"] = not current
     save_settings()
-    
+
     status = "ON" if settings["support_button_status"] else "OFF"
     bot.reply_to(message, f"✅ Support button is now <b>{status}</b>.", parse_mode="HTML")
 
 @bot.message_handler(commands=['proof_toggle'])
 def handle_proof_toggle(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
-        
+
     current = settings.get("payment_proof_status", False)
     settings["payment_proof_status"] = not current
     save_settings()
-    
+
     status = "ON" if settings["payment_proof_status"] else "OFF"
     bot.reply_to(message, f"✅ Payment Proof button is now <b>{status}</b>.", parse_mode="HTML")
 
 @bot.message_handler(commands=['force_join_toggle'])
 def handle_force_join_toggle(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
-        
+
     current = settings.get("force_join_status", True)
     settings["force_join_status"] = not current
     save_settings()
-    
+
     status = "ON" if settings["force_join_status"] else "OFF"
     bot.reply_to(message, f"✅ Force Join system is now <b>{status}</b>.", parse_mode="HTML")
 
 @bot.message_handler(commands=['set_proof_link'])
 def handle_set_proof_link(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
-        
+
     args = message.text.split()
     if len(args) < 2:
         bot.reply_to(message, "Usage: <code>/set_proof_link [url]</code>", parse_mode="HTML")
         return
-        
+
     url = args[1]
     settings['payment_proof_link'] = url
     save_settings()
@@ -1335,14 +1498,14 @@ def handle_set_proof_link(message):
 
 @bot.message_handler(commands=['set_buy_url'])
 def handle_set_buy_url(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
-        
+
     args = message.text.split()
     if len(args) < 2:
         bot.reply_to(message, "Usage: <code>/set_buy_url [url]</code>", parse_mode="HTML")
         return
-        
+
     url = args[1]
     settings['how_to_buy_url'] = url
     save_settings()
@@ -1350,7 +1513,7 @@ def handle_set_buy_url(message):
 
 @bot.message_handler(commands=['add_premium_ch'])
 def handle_add_premium_ch(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
         
     try:
@@ -1393,7 +1556,7 @@ def handle_add_premium_ch(message):
 
 @bot.message_handler(commands=['remove_premium_ch'])
 def handle_remove_premium_ch(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
         
     args = message.text.split()
@@ -1417,7 +1580,7 @@ def handle_remove_premium_ch(message):
 
 @bot.message_handler(commands=['edit_premium_ch'])
 def handle_edit_premium_ch(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
         
     try:
@@ -1450,7 +1613,7 @@ def handle_edit_premium_ch(message):
 
 @bot.message_handler(commands=['set_price'])
 def handle_set_price(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
         
     args = message.text.split()
@@ -1475,7 +1638,7 @@ def handle_set_price(message):
 
 @bot.message_handler(commands=['set_ch'])
 def handle_set_ch(message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
         
     args = message.text.split()
@@ -1497,7 +1660,7 @@ def handle_set_ch(message):
 @bot.message_handler(commands=['imp_to_mongo'])
 def handle_imp_to_mongo(message):
     """Import data from a JSON file directly to MongoDB via reply with merging"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     
     if not message.reply_to_message or not message.reply_to_message.document:
@@ -1590,13 +1753,13 @@ def handle_imp_to_mongo(message):
 @bot.message_handler(commands=['migrate_to_mongo'])
 def handle_migrate_to_mongo(message):
     """Manually migrate all local JSON data to MongoDB"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
-        
+
     msg = bot.reply_to(message, "⏳ <b>Migration started...</b>", parse_mode="HTML")
-    
+
     success, result = force_migrate_to_mongodb()
-    
+
     if success:
         files_str = ", ".join(result) if result else "None"
         bot.edit_message_text(
@@ -1616,20 +1779,20 @@ def handle_migrate_to_mongo(message):
 @bot.message_handler(commands=['auto_accept'])
 def handle_auto_accept_toggle(message):
     """Toggle auto-accept of join requests"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
-        
+
     current = settings.get('auto_accept_requests', False)
     settings['auto_accept_requests'] = not current
     save_settings()
-    
+
     status = "ON (Auto-Accepting)" if settings['auto_accept_requests'] else "OFF (Manual Approval)"
     bot.reply_to(message, f"✅ Auto-accept join requests is now <b>{status}</b>.", parse_mode="HTML")
 
 @bot.message_handler(commands=['approve_all'])
 def handle_approve_all_requests(message):
     """Approve all currently pending join requests in the list"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
         
     force_ch = settings.get('force_request_channel', '')
@@ -1660,7 +1823,7 @@ def handle_approve_all_requests(message):
             logging.error(f"Approve failed for {uid}: {e}")
             failed_count += 1
             
-    save_json_file(JOIN_REQUESTS_FILE, join_requests)
+    # save_json_file(JOIN_REQUESTS_FILE, join_requests) # Removed for batch saving
     
     bot.edit_message_text(
         f"✅ <b>Process Complete!</b>\n\n<b>Success:</b> {success_count}\n<b>Failed:</b> {failed_count}",
@@ -1672,7 +1835,7 @@ def handle_approve_all_requests(message):
 @bot.message_handler(commands=['set_force_ch'])
 def handle_set_force_ch(message):
     """Set the channel for force join request"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
         
     args = message.text.split()
@@ -1688,7 +1851,7 @@ def handle_set_force_ch(message):
 @bot.message_handler(commands=['set_force_msg'])
 def handle_set_force_msg(message):
     """Set the message sent after join request"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
         
     if not message.reply_to_message:
@@ -1709,7 +1872,7 @@ def handle_set_force_msg(message):
 @bot.message_handler(commands=['exportdata'])
 def handle_export_data(message):
     """Export all data as JSON"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     
     try:
@@ -1746,7 +1909,7 @@ def handle_export_data(message):
 @bot.message_handler(commands=['impdata'])
 def handle_impdata(message):
     """Import data from JSON file"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         bot.reply_to(message, "⛔ Admin access required!")
         return
     
@@ -1821,7 +1984,7 @@ def handle_impdata(message):
 @bot.message_handler(commands=['backup'])
 def handle_backup(message):
     """Create data backup"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     
     try:
@@ -1853,9 +2016,9 @@ def handle_backup(message):
 @bot.message_handler(commands=['savedata'])
 def handle_save_data(message):
     """Force save all data"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
-    
+
     try:
         save_all_data()
         bot.reply_to(
@@ -1870,7 +2033,7 @@ def handle_save_data(message):
 @bot.message_handler(commands=['cleanbackups'])
 def handle_clean_backups(message):
     """Clean old backup files"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     
     try:
@@ -1909,7 +2072,7 @@ def handle_clean_backups(message):
 @bot.message_handler(commands=['setstartmsg'])
 def handle_set_start_message(message):
     """Set custom start message"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     
     if not message.reply_to_message:
@@ -1941,7 +2104,7 @@ def handle_set_start_message(message):
 @bot.message_handler(commands=['getstartmsg'])
 def handle_get_start_message(message):
     """View current start message"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     
     if not start_message_data:
@@ -1968,9 +2131,9 @@ def handle_get_start_message(message):
 @bot.message_handler(commands=['clearstartmsg'])
 def handle_clear_start_message(message):
     """Clear custom start message"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
-    
+
     global start_message_data
     start_message_data = {}
     save_start_message()
@@ -1980,7 +2143,7 @@ def handle_clear_start_message(message):
 @bot.message_handler(commands=['pending'])
 def handle_pending(message):
     """Show pending verifications"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     
     if not pending_verifications:
@@ -2011,7 +2174,7 @@ def handle_pending(message):
 @bot.message_handler(commands=['help'])
 def handle_help(message):
     """Show help message"""
-    if str(message.from_user.id) != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         # User help
         user_help = f"""
 <b>🤖 Bot Commands:</b>
@@ -2070,6 +2233,7 @@ For premium: Click "Get Premium" button
 
 <b>📊 DATA:</b>
 /stats - Bot statistics
+/sales - View daily/weekly/monthly sales report
 /migrate_to_mongo - Force sync JSON files to MongoDB
 /imp_to_mongo (reply) - Import specific JSON file to MongoDB
 /exportdata - Export users data
@@ -2077,6 +2241,11 @@ For premium: Click "Get Premium" button
 /backup - Create backup
 /savedata - Force save
 /cleanbackups - Clean old backups
+
+<b>👑 ADMIN MANAGEMENT:</b>
+/add_admin [user_id] - Add new admin
+/remove_admin [user_id] - Remove admin
+/settings - View all settings
 
 <b>✏️ START MESSAGE:</b>
 /setstartmsg (reply) - Set custom start
@@ -2098,7 +2267,8 @@ For premium: Click "Get Premium" button
 # ========== SILENT HANDLER ==========
 @bot.message_handler(func=lambda message: True)
 def handle_all_messages(message):
-    # Ignore all other messages
+    # Log user messages for debugging if needed
+    # logging.debug(f"Received message: {message.text} from {message.from_user.id}")
     pass
 
 # ========== START BOT ==========
@@ -2108,7 +2278,7 @@ if __name__ == "__main__":
     print("=" * 60)
     
     print(f"✅ Bot Token: {BOT_TOKEN[:15]}...")
-    print(f"✅ Admin ID: {ADMIN_ID}")
+    print(f"✅ Admin IDs: {', '.join(settings.get('admin_ids', []))}")
     print(f"✅ Users Loaded: {len(users_data)}")
     print(f"✅ Pending: {len(pending_verifications)}")
     print(f"✅ Single Channel Price: ₹{settings.get('ch_price', '99')}")
@@ -2119,9 +2289,13 @@ if __name__ == "__main__":
     print("=" * 60)
     
     try:
-        # Include chat_member and chat_join_request in allowed_updates
-        bot.infinity_polling(allowed_updates=["message", "callback_query", "chat_member", "chat_join_request"])
+        print("🚀 Bot is starting polling...")
+        bot.infinity_polling(
+            timeout=60, 
+            long_polling_timeout=60,
+            allowed_updates=["message", "callback_query", "chat_member", "chat_join_request"]
+        )
     except Exception as e:
-        print(f"❌ Bot Error: {e}")
+        print(f"Bot Error: {e}")
         time.sleep(10)
         sys.exit(1)
