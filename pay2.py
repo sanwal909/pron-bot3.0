@@ -28,6 +28,7 @@ import base64
 import hashlib
 import json
 import random
+import re
 import threading
 import time
 import uuid
@@ -413,11 +414,55 @@ def dig_url(obj, _depth=0):
     return None
 
 
+def _as_float(value):
+    """Number-ish value ko float me badlo. '₹100', '1,000.50', '200 INR' bhi
+    chalta hai; bilkul parse na ho to None (crash nahi)."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    cleaned = re.sub(r"[^0-9.]", "", str(value))
+    if not cleaned or cleaned.count(".") > 1 or cleaned == ".":
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def normalize_amount(amount) -> str:
+    """Plan amount ko gateway-friendly number string me badlo.
+
+    Bot ke plan amounts aksar '₹100', '100rs', '1,000.50', 99, 99.0 jaise hote
+    hain — inhe '100', '100', '1000.5', '99', '99' bana dete hain. Bilkul
+    non-numeric value par ValueError raise karta hai.
+    """
+    if isinstance(amount, bool) or amount is None:
+        raise ValueError("amount is required")
+    if isinstance(amount, (int, float)):
+        f = float(amount)
+    else:
+        cleaned = re.sub(r"[^0-9.]", "", str(amount))
+        if not cleaned or cleaned.count(".") > 1 or cleaned == ".":
+            raise ValueError(f"invalid amount: {amount!r}")
+        try:
+            f = float(cleaned)
+        except ValueError:
+            raise ValueError(f"invalid amount: {amount!r}")
+    if f <= 0:
+        raise ValueError(f"amount must be > 0 (got {amount!r})")
+    return str(int(f)) if f.is_integer() else f"{f:g}"
+
+
 def fits_amount(amount, ch: dict) -> bool:
-    lo, hi = ch.get("min_recharge_limit"), ch.get("max_recharge_limit")
-    if lo not in (None, "", 0) and float(amount) < float(lo):
+    amt = _as_float(amount)
+    if amt is None:
+        return True
+    lo = _as_float(ch.get("min_recharge_limit"))
+    hi = _as_float(ch.get("max_recharge_limit"))
+    if lo is not None and lo > 0 and amt < lo:
         return False
-    if hi not in (None, "") and float(amount) > float(hi):
+    if hi is not None and hi > 0 and amt > hi:
         return False
     return True
 
@@ -637,9 +682,7 @@ class AccountManager:
                         sub_index: int | None = None) -> dict:
         """Kisi bhi free account se deposit order banao aur payment URL return karo.
         Sab accounts fail hone par DepositError raise hota hai."""
-        amount = str(amount).strip()
-        if not amount.isdigit() or int(amount) <= 0:
-            raise ValueError("amount must be a positive whole number")
+        amount = normalize_amount(amount)
 
         limit = self.max_attempts or len(self._states)
         tried: set = set()
