@@ -1232,7 +1232,7 @@ def _send_newpay_payment_link(chat_id, plan, plan_type, order_num):
             if not url:
                 raise RuntimeError("payment URL not returned")
         except Exception as e:
-            logging.error(f"pay2 order failed (order #{order_num}): {type(e).__name__}")
+            logging.error(f"pay2 order failed (order #{order_num}): {type(e).__name__}: {e}")
             try:
                 bot.edit_message_text(
                     "⚠️ <b>Payment link generate nahi ho paaya.</b>\n\n"
