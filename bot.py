@@ -1527,6 +1527,31 @@ def handle_payment_done(call):
     if msg_id in user_all_messages.get(str(chat_id), []):
         user_all_messages[str(chat_id)].remove(msg_id)
 
+    # Admin ko turant alert: user ne "Payment Done" claim kiya (screenshot se pehle).
+    # Sirf claim hai — bina pay kiye bhi ho sakta hai, isliye verify zaruri hai.
+    try:
+        _p = pending_verifications[str(user_id)]
+        _u = call.from_user
+        _alert = (
+            f"🔔 <b>PAYMENT DONE CLAIMED</b>\n"
+            f"👤 {_u.first_name or 'User'} (@{_u.username or 'N/A'})\n"
+            f"🆔 <code>{user_id}</code>\n"
+            f"📅 Plan: {_p.get('plan')}\n"
+            f"💰 Amount: ₹{_p.get('amount')}\n"
+            f"🧾 Order: #{_p.get('order_number')}\n"
+            f"🔁 Method: {'Online Link (pay2)' if settings.get('pay2_enabled') else 'UPI/QR'}\n"
+            f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"⚠️ <i>Ye sirf claim hai — user ne abhi screenshot nahi bheja. "
+            f"Bina pay kiye bhi claim ho sakta hai; screenshot aane par verify karein.</i>"
+        )
+        for _aid in settings.get('admin_ids', []):
+            try:
+                bot.send_message(_aid, _alert, parse_mode="HTML")
+            except Exception:
+                pass
+    except Exception as e:
+        logging.error(f"pay2 done-claim alert failed: {type(e).__name__}")
+
     screenshot_msg = verif.ask_for_screenshot(chat_id, user_id, pending_verifications[str(user_id)]['plan'])
     if screenshot_msg:
         track_msg(chat_id, screenshot_msg.message_id)
@@ -2009,6 +2034,64 @@ def handle_pay2_list(message):
         "\n\n<i>Remove: /pay2_remove &lt;phone&gt;</i>",
         parse_mode="HTML"
     )
+
+@bot.message_handler(commands=['pay2_balance', 'pay2_bal'])
+def handle_pay2_balance(message):
+    """Sare pay2 accounts ka balance dikhao (best-effort, login response se)."""
+    if not is_admin(message.from_user.id):
+        return
+
+    if not _PAY2_AVAILABLE:
+        bot.reply_to(
+            message,
+            "❌ <b>pay2 module load nahi hua.</b>\nFix: <code>pip install pycryptodome</code> phir restart karein.",
+            parse_mode="HTML"
+        )
+        return
+
+    if not settings.get('pay2_accounts'):
+        bot.reply_to(
+            message,
+            "👥 <b>Koi pay2 account configured nahi.</b>\n"
+            "Add: <code>/pay2_add &lt;phone&gt; &lt;password&gt;</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    m = bot.send_message(message.chat.id, "⏳ <b>Balances check kar raha hoon...</b>", parse_mode="HTML")
+
+    def _worker():
+        try:
+            rows = pay2.get_balances(config_path=os.path.join(config.DATA_DIR, "accounts.json"))
+        except Exception as e:
+            logging.error(f"pay2 balance failed: {type(e).__name__}")
+            rows = []
+
+        lines = []
+        for r in rows:
+            phone = r.get('phone', '?')
+            b = r.get('balance')
+            if isinstance(b, (int, float)):
+                lines.append(f"📱 <code>{phone}</code> — <b>₹{b:,.2f}</b>")
+            elif r.get('error'):
+                lines.append(f"📱 <code>{phone}</code> — ⚠️ {r['error']}")
+            else:
+                lines.append(f"📱 <code>{phone}</code> — ❓ N/A")
+        if not lines:
+            lines = ["<i>Koi account ya data nahi mila.</i>"]
+
+        text = ("💼 <b>NEW PAY ACCOUNTS — BALANCE</b>\n\n" + "\n".join(lines) +
+                "\n\n<i>N/A = balance field detect nahi hua (app ka balance API check karein).</i>")
+        try:
+            bot.edit_message_text(text, message.chat.id, m.message_id, parse_mode="HTML")
+        except Exception:
+            try:
+                bot.send_message(message.chat.id, text, parse_mode="HTML")
+            except Exception:
+                pass
+
+    threading.Thread(target=_worker, daemon=True).start()
+
 
 @bot.message_handler(commands=['ban'])
 def handle_ban(message):
@@ -4057,6 +4140,7 @@ def handle_help(message):
     → <b>Example:</b> <code>/pay2_add +91-9840795827 mypassword</code>
 /pay2_remove [phone]  - Account hatao
 /pay2_list            - Sabhi accounts dikhao (password masked)
+/pay2_balance         - Har account ka balance dikhao
 
 ━━━━━━━━━━━━━━━
 <b>🔹 QUICK SETTINGS (/set):</b>
