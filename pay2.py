@@ -414,6 +414,33 @@ def dig_url(obj, _depth=0):
     return None
 
 
+_BALANCE_HINTS = ("balance", "money", "wallet", "usermoney", "coin", "score", "credit", "gold")
+
+
+def _dig_balance(obj, _depth=0):
+    """Login response me se balance-jaisa number dhoondo (best-effort).
+    Exact key milte hi return; warna nested me recurse."""
+    if _depth > 5 or obj is None:
+        return None
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if any(h in kl for h in _BALANCE_HINTS):
+                num = _as_float(v)
+                if num is not None:
+                    return num
+        for v in obj.values():
+            found = _dig_balance(v, _depth + 1)
+            if found is not None:
+                return found
+    if isinstance(obj, list):
+        for v in obj:
+            found = _dig_balance(v, _depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
 def _as_float(value):
     """Number-ish value ko float me badlo. '₹100', '1,000.50', '200 INR' bhi
     chalta hai; bilkul parse na ho to None (crash nahi)."""
@@ -568,6 +595,7 @@ class AccountState:
         self.phone = phone
         self.password = password
         self.session: HallSession | None = None
+        self.balance = None  # login ke response se (best-effort)
         self.busy = False
         self.failures = 0
         self.orders = 0
@@ -673,8 +701,27 @@ class AccountManager:
         login_data = HallClient().login(st.phone, st.password)
         if login_data.get("code") != 1:
             raise DepositError(f"login failed: {login_data.get('msg')}")
-        st.session = HallSession(login_data.get("data") or login_data)
+        data = login_data.get("data") or login_data
+        st.balance = _dig_balance(data)
+        st.session = HallSession(data)
         return st.session
+
+    def balances(self, force: bool = False) -> list[dict]:
+        """Har account ka balance login se nikaalo. Fail par balance=None."""
+        out = []
+        for st in list(self._states):
+            if force or st.session is None:
+                try:
+                    with self._lock:
+                        st.session = None  # fresh login (balance update ke liye)
+                    st.balance = None
+                    self._session_for(st)
+                except Exception as e:
+                    out.append({"phone": st.phone, "balance": None,
+                                "error": type(e).__name__})
+                    continue
+            out.append({"phone": st.phone, "balance": st.balance})
+        return out
 
     # ------------------------------------------------------------------- public
 
@@ -746,6 +793,16 @@ def get_payment_url(amount, config_path: str | Path = ACCOUNTS_FILE, **kwargs) -
             if _manager is None:
                 _manager = AccountManager(config_path)
     return _manager.get_payment_url(amount, **kwargs)
+
+
+def get_balances(config_path: str | Path = ACCOUNTS_FILE, fresh: bool = True) -> list[dict]:
+    """Sabhi accounts ka balance: [{"phone": "...", "balance": 1234.5 | None}, ...]."""
+    global _manager
+    if _manager is None:
+        with _manager_lock:
+            if _manager is None:
+                _manager = AccountManager(config_path)
+    return _manager.balances(force=fresh)
 
 
 # ============================================================================ cli
