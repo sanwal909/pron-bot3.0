@@ -2,6 +2,7 @@ import telebot
 from telebot import types
 import time
 import threading
+import random
 from datetime import datetime, timedelta
 import logging
 
@@ -11,6 +12,77 @@ from config import *
 
 logger = logging.getLogger(__name__)
 
+# ========== BUTTON COLOR FIX (to_dict patch - same in bot.py) ==========
+_original_ikb_to_dict_verif = types.InlineKeyboardButton.to_dict
+def _patched_ikb_to_dict_verif(self):
+    json_dict = _original_ikb_to_dict_verif(self)
+    extra_color = getattr(self, 'button_color', None)
+    if extra_color is not None:
+        json_dict['color'] = extra_color
+    if not json_dict.get('color'):
+        extra_color2 = getattr(self, 'color', None)
+        if extra_color2 is not None:
+            json_dict['color'] = extra_color2
+    return json_dict
+types.InlineKeyboardButton.to_dict = _patched_ikb_to_dict_verif
+
+BUTTON_COLORS = [None, "primary", "positive", "negative"]
+BUTTON_COLORS_NO_NONE = ["primary", "positive", "negative"]
+BUTTON_COLORS_CHOICE = {
+    "blue": "primary",
+    "green": "positive",
+    "red": "negative",
+    "primary": "primary",
+    "positive": "positive",
+    "negative": "negative",
+    "default": None,
+    "none": None,
+    "": None,
+}
+
+def get_random_button_color():
+    return random.choice(BUTTON_COLORS)
+
+def get_random_button_color_nondefault():
+    return random.choice(BUTTON_COLORS_NO_NONE)
+
+def resolve_color(color_val):
+    if not color_val:
+        return None
+    if color_val in BUTTON_COLORS:
+        return color_val
+    return BUTTON_COLORS_CHOICE.get(str(color_val).lower(), None)
+
+def color_name_display(color_val):
+    c = resolve_color(color_val)
+    if c is None:
+        return "Default (White)"
+    if c == "primary":
+        return "🔵 Blue (primary)"
+    if c == "positive":
+        return "🟢 Green (positive)"
+    if c == "negative":
+        return "🔴 Red (negative)"
+    return str(color_val)
+
+def make_colored_button(text, **kwargs):
+    if 'url' not in kwargs and 'button_color' not in kwargs and 'color' not in kwargs:
+        color = get_random_button_color()
+        if color is not None:
+            kwargs['button_color'] = color
+    return types.InlineKeyboardButton(text, **kwargs)
+
+def make_channel_button(text, channel_color, **kwargs):
+    if 'url' in kwargs:
+        return types.InlineKeyboardButton(text, **kwargs)
+    if 'button_color' in kwargs or 'color' in kwargs:
+        return types.InlineKeyboardButton(text, **kwargs)
+    resolved = resolve_color(channel_color)
+    if resolved is None:
+        resolved = get_random_button_color_nondefault()
+    kwargs['button_color'] = resolved
+    return types.InlineKeyboardButton(text, **kwargs)
+
 class VerificationSystem:
     def __init__(self, bot):
         self.bot = bot
@@ -18,46 +90,71 @@ class VerificationSystem:
     
     def save_pending(self):
         """Save pending verifications"""
-        save_json_file(PENDING_VERIF_FILE, self.pending)
+        # save_json_file(PENDING_VERIF_FILE, self.pending) # Removed for batch saving
+        pass
     
+    def _invite_kwargs(self):
+        """Invite-link kwargs for the CURRENT mode.
+        - join_request_mode OFF → single-use direct link (member_limit=1)
+        - join_request_mode ON  → approval link (creates_join_request=True).
+          Telegram does NOT allow member_limit together with creates_join_request."""
+        expire = datetime.now() + timedelta(days=365)
+        if settings.get('join_request_mode', False):
+            return {'expire_date': expire, 'creates_join_request': True}
+        return {'expire_date': expire, 'member_limit': 1}
+
+    def _create_invite(self, chat_id):
+        """Create an invite link respecting the current mode.
+        Falls back to a normal single-use link if the installed pyTelegramBotAPI
+        build does not support creates_join_request."""
+        kwargs = self._invite_kwargs()
+        try:
+            return self.bot.create_chat_invite_link(chat_id=int(chat_id), **kwargs)
+        except TypeError:
+            # Older library: creates_join_request unsupported → normal link
+            return self.bot.create_chat_invite_link(
+                chat_id=int(chat_id), member_limit=1, expire_date=kwargs['expire_date']
+            )
+
     def create_invite_link(self, user_id, plan_type):
-        """Create unique invite link(s) for specific channel(s) based on plan"""
+        """Create TWO unique invite links per channel for specific plan.
+        Normal mode  : member_limit=1 (single-use) — 2 separate links.
+        Approval mode: creates_join_request=True — har join admin approval ke baad.
+        """
         global invite_links
         try:
             plan = config.PLANS[plan_type]
-            
+            INVITES_PER_CHANNEL = 2  # 2 links per channel
+
             # Special case for "all" channels
             if plan_type == "all":
                 channel_ids = plan.get('channel_ids', [])
                 valid_links = []
                 for idx, cid in enumerate(channel_ids, 1):
                     if not cid: continue
-                    try:
-                        invite = self.bot.create_chat_invite_link(
-                            chat_id=int(cid),
-                            member_limit=1,
-                            expire_date=datetime.now() + timedelta(days=365)
-                        )
-                        valid_links.append(f"Channel {idx}: {invite.invite_link}")
-                    except Exception as e:
-                        logger.error(f"Error creating invite for {cid}: {e}")
-                
+                    for link_num in range(1, INVITES_PER_CHANNEL + 1):
+                        try:
+                            invite = self._create_invite(cid)
+                            valid_links.append(f"Channel {idx} - Link {link_num}: {invite.invite_link}")
+                        except Exception as e:
+                            logger.error(f"Error creating invite for {cid} (link #{link_num}): {e}")
+
                 if not valid_links:
                     return "Error: No channel IDs configured for All Channels. Contact admin."
-                
+
                 # Store links
                 user_id_str = str(user_id)
                 if user_id_str not in invite_links:
                     invite_links[user_id_str] = []
-                
+
                 link_data = {
                     'plan': plan_type,
                     'links': valid_links,
                     'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
                 invite_links[user_id_str].append(link_data)
-                save_json_file(INVITE_LINKS_FILE, invite_links)
-                
+                # save_json_file(INVITE_LINKS_FILE, invite_links) # Removed for batch saving
+
                 return "\n".join(valid_links)
 
             # Standard case for single channel
@@ -65,107 +162,139 @@ class VerificationSystem:
             if not channel_id:
                 # Special fallback for demo if ID is missing but link exists
                 if plan_type == "demo" and settings.get('demo_channel_link'):
-                    return settings.get('demo_channel_link')
-                return f"Error: Channel ID not configured for {plan['name']}. Contact admin."
-            
-            expire_date = datetime.now() + timedelta(days=365)
-            invite = self.bot.create_chat_invite_link(
-                chat_id=int(channel_id),
-                member_limit=1,
-                expire_date=expire_date
-            )
-            
+                    demo_link = settings.get('demo_channel_link')
+                    return f"Link 1: {demo_link}\nLink 2: {demo_link}"
+                return "Error: Channel ID not configured. Contact admin."
+
+            # Create TWO invite links for single channel
+            valid_links = []
+            for link_num in range(1, INVITES_PER_CHANNEL + 1):
+                try:
+                    invite = self._create_invite(channel_id)
+                    valid_links.append(f"Link {link_num}: {invite.invite_link}")
+                except Exception as e:
+                    logger.error(f"Error creating invite #{link_num} for {channel_id}: {e}")
+
+            if not valid_links:
+                return "Error: Failed to create invite links. Contact admin."
+
+            # Store links
             user_id_str = str(user_id)
             if user_id_str not in invite_links:
                 invite_links[user_id_str] = []
-            
-            invite_links[user_id_str].append({
+
+            link_data = {
                 'plan': plan_type,
-                'link': invite.invite_link,
+                'links': valid_links,
                 'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
-            save_json_file(INVITE_LINKS_FILE, invite_links)
-            
-            return invite.invite_link
+            }
+            invite_links[user_id_str].append(link_data)
+            # save_json_file(INVITE_LINKS_FILE, invite_links) # Removed for batch saving
+
+            return "\n".join(valid_links)
         except Exception as e:
             logger.error(f"Invite Link Error: {e}")
             return f"Error creating link: {str(e)}"
 
     def plan_selection_keyboard(self):
-        """Dynamic Membership keyboard"""
+        """Dynamic Membership keyboard with channel-specific or random button colors"""
         keyboard = types.InlineKeyboardMarkup(row_width=1)
-        
+
         channels = settings.get("premium_channels", [])
         for ch in channels:
-            keyboard.add(types.InlineKeyboardButton(f"🔗 {ch['name']} - ₹{ch['amount']}", callback_data=f"plan_{ch['id']}"))
-            
-        keyboard.add(types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="main_menu"))
+            btn = make_channel_button(
+                f"🔗 {ch['name']} - ₹{ch['amount']}",
+                ch.get('color', ''),
+                callback_data=f"plan_{ch['id']}"
+            )
+            keyboard.add(btn)
+
+        back_btn = make_colored_button("⬅️ Back to Menu", callback_data="main_menu")
+        keyboard.add(back_btn)
         return keyboard
 
     def main_menu_keyboard(self):
-        """Main menu with 3 main buttons"""
+        """Main menu with premium channels shown directly + channel-based colors + Contact Support"""
         keyboard = types.InlineKeyboardMarkup(row_width=1)
-        
-        # 1. Premium Demo
+
+        # 1. Free Video Channel
         is_paid = settings.get('demo_paid_status', False)
         demo_amount = settings.get('demo_amount', '10')
         demo_link = settings.get('demo_channel_link', '')
-        
+
         if is_paid:
-            keyboard.add(types.InlineKeyboardButton(f"📢 Premium Demo (₹{demo_amount})", callback_data="plan_demo"))
+            demo_color = settings.get('demo_color', '') or ''
+            btn = make_channel_button(f"📢 Free Video Channel (₹{demo_amount})", demo_color, callback_data="plan_demo")
+            keyboard.add(btn)
         elif demo_link:
-            keyboard.add(types.InlineKeyboardButton("📢 Premium Demo", url=demo_link))
+            btn = types.InlineKeyboardButton("📢 Free Video Channel", url=demo_link)
+            keyboard.add(btn)
         else:
-            keyboard.add(types.InlineKeyboardButton("📢 Premium Demo (Not Set)", callback_data="demo_not_set"))
-            
-        # 2. Get Membership
-        keyboard.add(types.InlineKeyboardButton("💰 Get Membership", callback_data="get_membership"))
-        
-        # 3. How To Buy
-        how_to_buy_url = settings.get('how_to_buy_url', '')
-        if how_to_buy_url:
-            keyboard.add(types.InlineKeyboardButton("❓ How To Buy", url=how_to_buy_url))
-        else:
-            keyboard.add(types.InlineKeyboardButton("❓ How To Buy", callback_data="how_to_get"))
-        
-        # 4. Payment Proof Channel
+            btn = make_colored_button("📢 Free Video Channel (Not Set)", callback_data="demo_not_set")
+            keyboard.add(btn)
+
+        # 2. Premium Channels (Directly shown)
+        channels = settings.get("premium_channels", [])
+        for ch in channels:
+            btn = make_channel_button(
+                f"💎 {ch['name']} - ₹{ch['amount']}",
+                ch.get('color', ''),
+                callback_data=f"plan_{ch['id']}"
+            )
+            keyboard.add(btn)
+
+        # 3. Payment Proof Channel
         if settings.get("payment_proof_status", True):
             proof_link = settings.get('payment_proof_link', '')
             if proof_link:
-                keyboard.add(types.InlineKeyboardButton("🧾 Payment Proofs", url=proof_link))
+                btn = types.InlineKeyboardButton("🧾 Payment Proofs", url=proof_link)
+                keyboard.add(btn)
             else:
-                keyboard.add(types.InlineKeyboardButton("🧾 Payment Proofs (Not Set)", callback_data="proof_not_set"))
+                btn = make_colored_button("🧾 Payment Proofs (Not Set)", callback_data="proof_not_set")
+                keyboard.add(btn)
 
-        # Optional: Support Button
-        if settings.get("support_button_status", True):
-            support_user = settings.get('support_username', '')
-            if support_user:
-                keyboard.add(types.InlineKeyboardButton("📞 Support", url=f"https://t.me/{support_user}"))
+        # 4. Contact Support (only if status ON)
+        if settings.get("support_status", True):
+            support_uname = settings.get('support_username', '')
+            if support_uname:
+                uname_clean = support_uname.lstrip('@')
+                support_url = f"https://t.me/{uname_clean}"
+                btn = types.InlineKeyboardButton("📞 Contact Support", url=support_url)
+                keyboard.add(btn)
             else:
-                keyboard.add(types.InlineKeyboardButton("📞 Support (Not Set)", callback_data="support_not_set"))
-        
+                btn = make_colored_button("📞 Contact Support (Not Set)", callback_data="support_not_set")
+                keyboard.add(btn)
+
         return keyboard
     
     def ask_for_screenshot(self, chat_id, user_id, plan_type):
         """Ask user to send payment screenshot"""
         plan = config.PLANS[plan_type]
-        
+        pending_data = self.pending.get(str(user_id), {})
+        order_num = pending_data.get('order_number', 'N/A')
+
+        # Mark the time when user was asked for screenshot (for auto-cleanup)
+        pending_data['screenshot_requested_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.save_pending()
+
+        # 2nd payment method ON hone par UPI ID line ki zarurat nahi (online link se pay hota hai)
+        upi_line = "" if settings.get('pay2_enabled') else f"<b>UPI ID:</b> <code>{settings['upi_id']}</code>\n"
+
         msg = self.bot.send_message(
             chat_id,
             f"""
-<b>📸 SEND PAYMENT SCREENSHOT</b>
+<b>📸 SEND PAYMENT SCREENSHOT (Order #{order_num})</b>
 
 <b>Plan Selected:</b> {plan['name']}
 <b>Amount to Pay:</b> ₹{plan['amount']}
-<b>UPI ID:</b> <code>{settings['upi_id']}</code>
-
+{upi_line}
 ✅ <b>Payment Done!</b>
 
 Now please send the <b>payment screenshot</b> for verification.
 
 <b>Instructions:</b>
 1. Take screenshot of UPI payment
-2. Send it here as photo
+2. Send it here as <b>PHOTO / IMAGE</b> (NOT as a File/Document)
 3. Admin will verify within few minutes
 4. You'll receive unique join link after verification
 
@@ -183,6 +312,25 @@ Now please send the <b>payment screenshot</b> for verification.
         if user_id not in self.pending:
             return False
         
+        pending_data = self.pending[user_id]
+        
+        # RESTRICTION: If screenshot already uploaded and not yet verified/rejected, block new one
+        if pending_data.get('screenshot_file_id'):
+            order_num = pending_data.get('order_number', 'N/A')
+            self.bot.reply_to(
+                message,
+                f"""
+⛔ <b>ALREADY SUBMITTED!</b>
+
+Aapka payment screenshot (Order #{order_num}) pehle se hi submit ho chuka hai.
+Jab tak admin purane payment ko verify/reject nahi kar dete, aap naya screenshot upload nahi kar sakte.
+
+⏳ <i>Please wait for admin verification...</i>
+                """,
+                parse_mode="HTML"
+            )
+            return True
+        
         if not message.photo:
             self.bot.reply_to(
                 message,
@@ -190,7 +338,6 @@ Now please send the <b>payment screenshot</b> for verification.
             )
             return True
         
-        pending_data = self.pending[user_id]
         plan_type = pending_data['plan']
         plan = config.PLANS[plan_type]
         
@@ -207,18 +354,21 @@ Now please send the <b>payment screenshot</b> for verification.
         # Create verification buttons for admin
         keyboard = types.InlineKeyboardMarkup(row_width=2)
         verify_btn = types.InlineKeyboardButton(
-            "✅ Verify Payment", 
-            callback_data=f"verify_{user_id}"
+            "✅ Verify Payment",
+            callback_data=f"verify_{user_id}",
+            button_color="positive"
         )
         reject_btn = types.InlineKeyboardButton(
-            "❌ Reject", 
-            callback_data=f"reject_{user_id}"
+            "❌ Reject",
+            callback_data=f"reject_{user_id}",
+            button_color="negative"
         )
         keyboard.add(verify_btn, reject_btn)
         
         # Forward screenshot to admin log channel
+        order_num = pending_data.get('order_number', 'N/A')
         caption = f"""
-📸 <b>PAYMENT SCREENSHOT RECEIVED</b>
+📸 <b>PAYMENT SCREENSHOT RECEIVED (Order #{order_num})</b>
 
 👤 User: @{message.from_user.username or 'N/A'}
 🆔 User ID: <code>{user_id}</code>
@@ -230,22 +380,38 @@ Now please send the <b>payment screenshot</b> for verification.
         """
         
         try:
-            # Send screenshot to log channel or fallback to Admin ID
+            # Send screenshot to log channel or fallback to first Admin ID
             target_chat = settings.get('log_channel')
-            if not target_chat:
-                target_chat = config.ADMIN_ID
-                
-            sent_msg = self.bot.send_photo(
-                target_chat,
-                photo=file_id,
-                caption=caption,
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
+            
+            # Check if bot can send to target_chat
+            try:
+                sent_msg = self.bot.send_photo(
+                    target_chat,
+                    photo=file_id,
+                    caption=caption,
+                    reply_markup=keyboard,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                # If log channel fails, try primary admin
+                if "Forbidden" in str(e) or "chat not found" in str(e).lower():
+                    primary_admin = settings['admin_ids'][0] if settings.get('admin_ids') else None
+                    if primary_admin and str(primary_admin) != str(target_chat):
+                        sent_msg = self.bot.send_photo(
+                            primary_admin,
+                            photo=file_id,
+                            caption=caption + "\n\n⚠️ <i>(Log channel forbidden/not found, sent to admin)</i>",
+                            reply_markup=keyboard,
+                            parse_mode="HTML"
+                        )
+                    else:
+                        raise e
+                else:
+                    raise e
             
             # Store admin message ID
             pending_data['admin_msg_id'] = sent_msg.message_id
-            pending_data['admin_chat_id'] = target_chat
+            pending_data['admin_chat_id'] = sent_msg.chat.id
             self.save_pending()
             
             # Notify user
@@ -266,7 +432,7 @@ You'll receive unique join link within few minutes.
             logger.error(f"Error forwarding screenshot: {e}")
             self.bot.reply_to(
                 message,
-                f"❌ Error sending screenshot. Please contact @{settings['support_username']}"
+                f"❌ Error sending screenshot. Please try again later."
             )
         
         return True
@@ -291,6 +457,22 @@ You'll receive unique join link within few minutes.
         
         # Send join link to user
         try:
+            approval_mode = bool(settings.get('join_request_mode', False))
+            if approval_mode:
+                links_heading = "<b>👇 Your Approval Links (join request bhejo):</b>"
+                mode_note = (
+                    "🔐 <b>Admin Approval Required:</b> Link pe click karke <b>join request</b> bhejo.\n"
+                    "   Admin approve karega, uske baad aap channel me add ho jayenge.\n"
+                    "   ⏳ Thoda wait karein — approval me time lag sakta hai."
+                )
+            else:
+                links_heading = "<b>👇 Your Invite Links (2 Links, 1 use each):</b>"
+                mode_note = (
+                    "⚠️ <b>Important:</b> You received <b>2 UNIQUE LINKS</b> — each link works for <b>ONLY 1 PERSON</b>.\n"
+                    "   • <b>Link 1:</b> Join yourself\n"
+                    "   • <b>Link 2:</b> Share with a friend / family (one more person)"
+                )
+
             if plan_type == "demo":
                 join_msg = f"""
 🎉 <b>DEMO ACCESS VERIFIED!</b>
@@ -298,10 +480,10 @@ You'll receive unique join link within few minutes.
 <b>Plan:</b> {plan['name']}
 <b>Amount Paid:</b> ₹{plan['amount']}
 
-<b>👇 Your Unique Demo Invite Link (Single Use):</b>
+{links_heading}
 {invite_link}
 
-⚠️ <b>Note:</b> This link can only be used ONCE.
+{mode_note}
 📅 <b>Access Duration:</b> {plan.get('duration', '30 Days')}
 
 <b>Enjoy your demo! 🍿</b>
@@ -313,10 +495,10 @@ You'll receive unique join link within few minutes.
 <b>Plan:</b> {plan['name']}
 <b>Amount Paid:</b> ₹{plan['amount']}
 
-<b>👇 Your Unique Invite Link (Single Use):</b>
+{links_heading}
 {invite_link}
 
-⚠️ <b>Note:</b> This link can only be used ONCE and is personal to you.
+{mode_note}
 📅 <b>Access Duration:</b> {plan.get('duration', '30 Days')}
 
 <b>Welcome to Premium Family! 🎊</b>
@@ -329,26 +511,79 @@ You'll receive unique join link within few minutes.
             )
             
             # Log verification
+            order_num = pending_data.get('order_number', 'N/A')
+            mode_line = "🔐 Mode: Admin Approval (join request)\n" if approval_mode else ""
             log_msg = f"""
-✅ <b>PAYMENT VERIFIED</b>
+✅ <b>PAYMENT VERIFIED (Order #{order_num})</b>
 
 👤 User ID: <code>{user_id}</code>
 📅 Plan: {plan['name']}
 💰 Amount: ₹{plan['amount']}
 👮 Verified By: Admin
-🔗 Invite Link: {invite_link}
+{mode_line}🔗 Invite Link: {invite_link}
 ⏰ Time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
             """
             
             target_chat = settings.get('log_channel')
-            if not target_chat:
-                target_chat = config.ADMIN_ID
-                
-            self.bot.send_message(
-                target_chat,
-                log_msg,
-                parse_mode="HTML"
-            )
+            try:
+                if target_chat:
+                    self.bot.send_message(
+                        target_chat,
+                        log_msg,
+                        parse_mode="HTML"
+                    )
+            except Exception as e:
+                logger.error(f"Log channel error: {e}")
+                # Fallback to admin if log channel fails
+                primary_admin = settings['admin_ids'][0] if settings.get('admin_ids') else None
+                if primary_admin and str(primary_admin) != str(target_chat):
+                    try:
+                        self.bot.send_message(
+                            primary_admin,
+                            log_msg + "\n\n⚠️ <i>(Log channel failed)</i>",
+                            parse_mode="HTML"
+                        )
+                    except:
+                        pass
+            
+            # Record Sale
+            sale_record = {
+                'order_number': order_num,
+                'user_id': user_id,
+                'plan_type': plan_type,
+                'plan_name': plan['name'],
+                'amount': config.parse_amount(plan.get('amount'), 0.0),
+                'upi_id': settings.get('upi_id', 'Unknown'),
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'date': datetime.now().strftime("%Y-%m-%d"),
+                'admin_id': admin_id,
+                'screenshot_file_id': pending_data.get('screenshot_file_id', '')
+            }
+            sales_data.append(sale_record)
+
+            # Send proof to proof channel
+            proof_channel = settings.get('proof_channel_id', '')
+            if proof_channel and pending_data.get('screenshot_file_id'):
+                user_name = pending_data.get('first_name', 'N/A')
+                proof_caption = f"""
+✅ <b>PAYMENT PROOF VERIFIED</b>
+
+👤 <b>Name:</b> {user_name}
+🆔 <b>User ID:</b> <code>{user_id}</code>
+📅 <b>Plan:</b> {plan['name']}
+💰 <b>Amount:</b> ₹{plan['amount']}
+🧾 <b>Order #:</b> {order_num}
+⏰ <b>Date:</b> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+                """
+                try:
+                    self.bot.send_photo(
+                        proof_channel,
+                        photo=pending_data['screenshot_file_id'],
+                        caption=proof_caption,
+                        parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.error(f"Proof channel error: {e}")
             
             # Update user data to mark as premium
             if user_id in users_data:
@@ -359,7 +594,7 @@ You'll receive unique join link within few minutes.
                     else (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
                 )
                 users_data[user_id]['invite_link'] = invite_link
-                save_users_data()
+                # save_users_data() # Removed for batch saving
             
             # Remove from pending
             del self.pending[user_id]
@@ -392,8 +627,7 @@ Your payment screenshot could not be verified.
 • Wrong amount paid
 • Payment not received
 
-<b>Please try again or contact support:</b>
-📞 @{settings['support_username']}
+<b>Please try again:</b>
             """
             
             self.bot.send_message(
@@ -413,13 +647,14 @@ Your payment screenshot could not be verified.
             
             target_chat = settings.get('log_channel')
             if not target_chat:
-                target_chat = config.ADMIN_ID
+                target_chat = settings['admin_ids'][0] if settings.get('admin_ids') else None
                 
-            self.bot.send_message(
-                target_chat,
-                log_msg,
-                parse_mode="HTML"
-            )
+            if target_chat:
+                self.bot.send_message(
+                    target_chat,
+                    log_msg,
+                    parse_mode="HTML"
+                )
             
             # Remove from pending
             del self.pending[user_id]
