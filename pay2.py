@@ -1,0 +1,747 @@
+"""
+In666 / CQPAY deposit automation -- SINGLE FILE (2nd payment option for the bot).
+
+Ye ek hi file me sab kuch hai: cipher (AES-128-CBC), login, aur poora deposit
+flow. Kisi doosri module ki zarurat nahi -- bas is file ko apne bot me import
+kar lo.
+
+    import pay2
+    res = pay2.get_payment_url(500)
+    # -> {"url": "https://pay.cqpay.me/pay/XXXX",
+    #     "orderNo": "...", "amount": "500",
+    #     "channel": "UPI", "sub_channel": "UPI.67", "account": "+91-..."}
+
+    res["url"]  <-- yahi final payment URL hai (Telegram button me lagao).
+
+Accounts: bot admin Telegram se accounts set karta hai (pay2.configure_accounts),
+warna `accounts.json` file (ya ACCOUNTS env var) se load hote hain. Har naya
+order agle account par jaata hai (round-robin) aur koi account fail ho to
+automatically next account pe switch ho jaata hai. Thread-safe hai (bot ke liye).
+
+Bot integration (bot.py): admin /pay2_toggle se ON/OFF karta hai. ON hone par
+ye module payment link banata hai; purana manual UPI/QR method OFF ho jata hai.
+
+Deps:  pip install requests pycryptodome
+"""
+
+import base64
+import hashlib
+import json
+import random
+import threading
+import time
+import uuid
+from pathlib import Path
+from urllib.parse import urlencode
+
+import requests
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
+
+# ============================================================================ config
+
+BASE_URL = "https://a666ni.in666.cc"
+LOGIN_PATH = "/hall/api/member/login"
+
+DOMAIN = "www.in66677.com"
+ORIGIN = f"https://{DOMAIN}"
+SITECODE = "2338"
+
+APP_VERSION = "v7.5.183"
+APP_VERSION_SHORT = "7.5.183"
+APP_BUILD_MS = 1792210926000
+
+CURRENCY = "INR"
+CLIENT_TIMEZONE = "+5.5"
+
+# `token` header + cipher key dono isi value se derive hote hain.
+STATIC_TOKEN = "b2e3d672-9d88-47a7-81b4-9d7ffc62054f"
+SESSION_TOKEN = STATIC_TOKEN
+
+USER_AGENT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 "
+    "Mobile/15E148 Safari/604.1"
+)
+
+# Ek "device"/session identify karte hain.
+DEVICE_ID = str(uuid.uuid4())
+BROWSER_FINGER_ID = "GEE3-01-" + uuid.uuid4().hex + uuid.uuid4().hex
+
+FINANCE = "/hall/api/finance/pay"
+PAY_TAB_CONFIG = "-"
+OS_TYPE = 5
+PAY_KIND = 100
+
+# Site 503/126/128 ka hardcoded sign key.
+STATIC_SIGN_KEY = "fc361cdb770aebc2126cc0dac989c896"
+
+ACCOUNTS_FILE = "accounts.json"
+ORDER_COOLDOWN = 90  # failure ke baad account itne second parked rehta hai
+
+
+class DepositError(Exception):
+    """Login / listing / paysubmit me koi bhi failure."""
+
+    def __init__(self, message: str, response=None):
+        super().__init__(message)
+        self.response = response
+
+
+# ============================================================================ cipher
+
+IV = b"5421698523412578"
+
+
+def _md5(s: str) -> str:
+    return hashlib.md5(s.encode()).hexdigest()
+
+
+def key_k1(token: str) -> bytes:
+    """md5(token + md5(token))[2:18] -> 16 ASCII bytes (login / static-token path)."""
+    return _md5(token + _md5(token))[2:18].encode()
+
+
+def key_k2(token: str, username: str) -> bytes:
+    """md5(token + username)[0:16] -> 16 ASCII bytes (per-user token path)."""
+    return _md5(token + username)[:16].encode()
+
+
+def _zero_pad(data: bytes) -> bytes:
+    """CryptoJS ZeroPadding: \\x00 se next 16-byte boundary tak."""
+    rem = len(data) % 16
+    return data if rem == 0 else data + b"\x00" * (16 - rem)
+
+
+class Cipher:
+    def __init__(self, token: str = STATIC_TOKEN, username: str = "", key_type: str = "k1"):
+        if key_type == "k2":
+            self.key = key_k2(token, username)
+        elif key_type == "k1":
+            self.key = key_k1(token)
+        else:  # auto (bundle gk()): static token -> k1, warna k2
+            self.key = key_k1(token) if token == STATIC_TOKEN else key_k2(token, username)
+
+    def encrypt(self, plaintext: str) -> str:
+        data = _zero_pad(plaintext.encode())
+        return base64.b64encode(AES.new(self.key, AES.MODE_CBC, IV).encrypt(data)).decode()
+
+    def decrypt(self, ciphertext_b64: str) -> str:
+        raw = AES.new(self.key, AES.MODE_CBC, IV).decrypt(base64.b64decode(ciphertext_b64))
+        try:
+            return unpad(raw, 16).decode()
+        except ValueError:
+            return raw.rstrip(b"\x00").decode()
+
+
+# ============================================================================ login
+
+def build_login_payload(phone: str, password: str) -> dict:
+    """Plaintext login body (loginType 4). `phone` me country code ho, jaise
+    `+91-9840795827` (dash zaruri hai)."""
+    return {
+        "domain": ORIGIN,
+        "clientType": 5,
+        "jpush_id": "",
+        "loginId": DEVICE_ID,
+        "os_type": 5,
+        "deviceOsType": 5,
+        "deviceModel": "Mobile Safari v18.5",
+        "platformType": "1001",
+        "operationId": 0,
+        "pkgId": 1,
+        "fromClub": 2,
+        "networkType": "UNKNOWN",
+        "version": 9,
+        "loginType": 4,
+        "phone": phone,
+        "userpass": password,
+        "geeToken": "disabled",
+        "time": int(time.time()),
+    }
+
+
+def build_headers(extra: dict | None = None) -> dict:
+    now_ms = int(time.time() * 1000)
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "en",
+        "appsystem": "iOS 18.5",
+        "appversion": APP_VERSION,
+        "browserfingerid": BROWSER_FINGER_ID,
+        "browsertype": "Mobile Safari v18.5",
+        "clienttimezone": CLIENT_TIMEZONE,
+        "content-type": "application/json",
+        "currency": CURRENCY,
+        "device": DEVICE_ID,
+        "devicebrand": "iPhone",
+        "devicemodel": "Mobile Safari v18.5",
+        "domain": DOMAIN,
+        "language": "en",
+        "operatingsystem": "iOS",
+        "origin": ORIGIN,
+        "physicaldevicemodel": "unknown",
+        "platformtype": "5",
+        "priority": "u=1, i",
+        "referer": f"{ORIGIN}/",
+        "sec-ch-ua": '"Not:A-Brand";v="8", "Chromium";v="156", "Brave";v="156"',
+        "sec-ch-ua-mobile": "?1",
+        "sec-ch-ua-platform": '"iOS"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "cross-site",
+        "sec-gpc": "1",
+        "sitecode": SITECODE,
+        "timestamp": str(int(time.time())),
+        "token": SESSION_TOKEN,
+        "user-agent": USER_AGENT,
+        "webauthndomain": DOMAIN,
+        "x-custom-referer": f"{ORIGIN}/home/login",
+        "x-data-mode": "json_cipher",
+        "x-device": "3-1",
+        "x-object-id": json.dumps(
+            {
+                "uid": "",
+                "browserLanguage": "en-US",
+                "init": {
+                    "device": DEVICE_ID,
+                    "created": now_ms,
+                    "version": APP_BUILD_MS,
+                },
+            },
+            separators=(",", ":"),
+        ),
+        "x-request-id": str(uuid.uuid4()),
+        "x-version": APP_VERSION_SHORT,
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+class HallClient:
+    """Bas login ke liye client (cipher + headers)."""
+
+    def __init__(self, base_url: str = BASE_URL, token: str = SESSION_TOKEN):
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.session = requests.Session()
+        self.access_token: str | None = None
+        self.refresh_token: str | None = None
+
+    def _unwrap_response(self, resp: requests.Response) -> dict:
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict) and "encryptString" in data:
+            cipher = Cipher(self.token, key_type="k1")
+            return json.loads(cipher.decrypt(data["encryptString"]))
+        return data
+
+    def login(self, phone: str, password: str) -> dict:
+        cipher = Cipher(self.token, username=phone, key_type="k1")
+        body = {"encryptString": cipher.encrypt(json.dumps(build_login_payload(phone, password)))}
+
+        resp = self.session.post(
+            f"{self.base_url}{LOGIN_PATH}",
+            headers=build_headers(),
+            json=body,
+            timeout=20,
+        )
+        data = self._unwrap_response(resp)
+
+        self.access_token = data.get("accessToken") or data.get("token")
+        self.refresh_token = data.get("refreshToken")
+        return data
+
+
+# ============================================================================ session
+
+
+class HallSession:
+    """Authenticated client: ek logged-in account + json_cipher plumbing."""
+
+    def __init__(self, login_data: dict, sitecode: str = SITECODE):
+        self.username = str(login_data["username"])
+        self.session_key = login_data["session_key"]
+        self.jwt_token = login_data["jwt_token"]
+        self.userkey = login_data.get("userkey", "")
+        self.sitecode = sitecode
+        self.session = requests.Session()
+        self.cipher = Cipher(self.session_key, username=self.username, key_type="k2")
+        self.sign_key = ""
+
+    def auth_headers(self) -> dict:
+        return build_headers(
+            {
+                "token": self.session_key,
+                "newJwt": self.jwt_token,
+                "UserId": self.username,
+                "SiteCode": self.sitecode,
+                "fingerprint": BROWSER_FINGER_ID,
+                "device_id": DEVICE_ID,
+                "cache": "1",
+            }
+        )
+
+    def _unwrap(self, resp: requests.Response) -> dict:
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict) and "encryptString" in data:
+            return json.loads(self.cipher.decrypt(data["encryptString"]))
+        return data
+
+    def request(self, path: str, payload: dict | None = None, base_url: str | None = None) -> dict:
+        body = None
+        if payload is not None:
+            body = {"encryptString": self.cipher.encrypt(json.dumps(payload))}
+
+        resp = self.session.post(
+            (base_url or BASE_URL) + path,
+            headers=self.auth_headers(),
+            json=body,
+            timeout=20,
+        )
+        return self._unwrap(resp)
+
+    def plain_post(self, path: str, payload: dict) -> dict:
+        """Un-encrypted JSON body (payplatformlistV3), par reply encrypted hi aata hai."""
+        resp = self.session.post(
+            BASE_URL + path,
+            headers=self.auth_headers(),
+            json=payload,
+            timeout=20,
+        )
+        return self._unwrap(resp)
+
+    # ------------------------------------------------------------- channel listing
+
+    def pay_kinds(self) -> dict:
+        res = self.request(
+            f"{FINANCE}/payListV4",
+            {"noCache": 0, "payCurrency": "", "osType": OS_TYPE},
+        )
+        if isinstance(res.get("data"), dict):
+            self.sign_key = res["data"].get("sign_key") or self.sign_key
+        return res
+
+    def pay_channels(self, kind_type: int) -> dict:
+        res = self.request(
+            f"{FINANCE}/payTypeV4",
+            {"type": kind_type, "noCache": 0, "payTabConfig": PAY_TAB_CONFIG},
+        )
+        if isinstance(res.get("data"), dict):
+            self.sign_key = res["data"].get("sign_key") or self.sign_key
+        return res
+
+    def platform_channels(self, payplatformid: int, pay_kind: int = PAY_KIND) -> dict:
+        return self.plain_post(
+            f"{FINANCE}/payplatformlistV3",
+            {"payplatformid": payplatformid, "payCurrency": "", "payKind": pay_kind},
+        )
+
+    # --------------------------------------------------------------- order submit
+
+    def paysubmit(self, url: str, payload: dict) -> dict:
+        """Bundle fn `Cu()` -> GET {url}?{query}."""
+        headers = self.auth_headers()
+        headers["Web-Version"] = APP_VERSION
+        headers["Sign-key"] = str(payload.get("signKey", ""))
+        headers["UserId"] = self.username
+        headers.pop("content-type", None)
+
+        query = urlencode({k: v for k, v in payload.items() if v not in (None, "")})
+        sep = "&" if "?" in url else "?"
+        resp = self.session.get(f"{url}{sep}{query}", headers=headers, timeout=20)
+        return self._unwrap(resp)
+
+
+# ============================================================================ sign
+
+
+def _sign_key_for(sign_key: str, sitecode: str) -> str:
+    """Site 503/126/128 hardcoded sign key use karti hain; baaki returned one."""
+    return STATIC_SIGN_KEY if sitecode in ("503", "126", "128") else sign_key
+
+
+def paysubmit_sign(payload: dict, sign_key: str, sitecode: str, is_merge: bool = False) -> str:
+    """Bundle fn `$u()`: ordered `key=value` pairs + `&key=<signKey>`, md5'd."""
+    order = [
+        "username", "amount", "paytype", "payplatformid", "time",
+        "platformId", "gameId", "currencyCode", "mobilePhone", "email",
+        "cardNumber", "cardPassword", "networkMerch", "bankCode", "bankName",
+        "merchCode",
+    ]
+    parts = []
+    for k in order:
+        if k == "payplatformid" and is_merge:
+            continue
+        v = payload.get(k)
+        if v in (None, ""):
+            continue
+        parts.append(f"{k}={v}")
+    if is_merge:
+        for k in ("payplatformids", "id"):
+            v = payload.get(k)
+            if v not in (None, ""):
+                parts.append(f"{k}={v}")
+
+    return _md5("&".join(parts) + f"&key={_sign_key_for(sign_key, sitecode)}")
+
+
+# ============================================================================ helpers
+
+
+def dig_url(obj, _depth=0):
+    """Response me kahin bhi pehla http(s) URL dhoondo."""
+    if _depth > 6:
+        return None
+    if isinstance(obj, str):
+        return obj if obj.startswith("http") else None
+    if isinstance(obj, dict):
+        for key in ("urlData", "url", "payUrl", "payAddress", "qrCode"):
+            if isinstance(obj.get(key), str) and obj[key].startswith("http"):
+                return obj[key]
+        for v in obj.values():
+            found = dig_url(v, _depth + 1)
+            if found:
+                return found
+    if isinstance(obj, list):
+        for v in obj:
+            found = dig_url(v, _depth + 1)
+            if found:
+                return found
+    return None
+
+
+def fits_amount(amount, ch: dict) -> bool:
+    lo, hi = ch.get("min_recharge_limit"), ch.get("max_recharge_limit")
+    if lo not in (None, "", 0) and float(amount) < float(lo):
+        return False
+    if hi not in (None, "") and float(amount) > float(hi):
+        return False
+    return True
+
+
+def pick_channel(amount, channels: list) -> dict | None:
+    """Pehla channel jiska recharge limit `amount` allow kare."""
+    for ch in channels:
+        if fits_amount(amount, ch):
+            return ch
+    return None
+
+
+def random_rn() -> str:
+    """Bundle `Tc()`: 8-digit random number (`rn`)."""
+    return str(random.randint(10_000_000, 99_999_999))
+
+
+def build_payment_payload(s: HallSession, amount, parent: dict, sub: dict) -> dict:
+    """Bundle ka `De` object for the paysubmit GET (built inside `bd()`)."""
+    open_way = sub.get("openWay") or parent.get("combineOpenWay") or 5
+    payload = {
+        "username": s.username,
+        "amount": str(amount),
+        "paytype": parent.get("paymentid") or parent.get("payplatformid"),
+        "payplatformid": str(sub.get("payplatformid") or sub.get("id")),
+        "time": int(time.time()),
+        "language": "en",
+        "siteCode": s.sitecode,
+        "currencyCode": sub.get("payCurrency") or CURRENCY,
+        "source": "web",
+        "version": open_way,
+        "pnt": "NORMAL",
+        "tk": s.session_key,
+        "fp": BROWSER_FINGER_ID,
+        "xDevice": "3-1",
+        "ld": DEVICE_ID,
+        "rn": random_rn(),
+        "payEntryId": 0,
+        "merchCode": sub.get("merchCode", ""),
+    }
+    payload["sign"] = paysubmit_sign(payload, s.sign_key, s.sitecode)
+    payload["signKey"] = s.sign_key[-4:]
+    payload["webUrl"] = DOMAIN
+    payload["webVersion"] = APP_VERSION
+    return payload
+
+
+# ============================================================================ order
+
+
+def create_deposit(s: HallSession, amount, kind_type: int = 1,
+                   channel_index: int = 0, sub_index: int | None = None) -> dict:
+    """Poora deposit flow ek logged-in session par:
+    payListV4 -> payTypeV4 -> payplatformlistV3 -> GET paysubmit."""
+    kinds = s.pay_kinds()
+    kind_list = (kinds.get("data") or {}).get("list") or []
+    if kinds.get("code") != 1 or not kind_list:
+        raise DepositError("payListV4 failed", kinds)
+
+    if kind_type not in [k["type"] for k in kind_list]:
+        kind_type = kind_list[0]["type"]
+
+    res = s.pay_channels(kind_type)
+    channels = ((res.get("data") or {}).get("payKind") or {}).get("list") or []
+    if not channels:
+        raise DepositError("no pay channels returned", res)
+    parent = channels[channel_index] if channel_index < len(channels) else channels[0]
+
+    plat = s.platform_channels(parent.get("payplatformid"))
+    pdata = plat.get("data") or {}
+    pay_url, subs = pdata.get("url"), pdata.get("list") or []
+    if plat.get("code") != 1 or not pay_url or not subs:
+        raise DepositError("no paysubmit url / sub-channels", plat)
+
+    if sub_index is not None and sub_index < len(subs):
+        sub = subs[sub_index]
+    else:
+        sub = pick_channel(amount, subs) or subs[0]
+
+    resp = s.paysubmit(pay_url, build_payment_payload(s, amount, pdata, sub))
+    inner = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+    url = inner.get("url") or inner.get("payAddress") or dig_url(resp)
+    if not url:
+        raise DepositError(inner.get("msg") or "paysubmit did not return a URL", resp)
+
+    return {
+        "url": url,
+        "orderNo": inner.get("orderNo") or "",
+        "amount": str(amount),
+        "channel": parent.get("payname") or "",
+        "sub_channel": sub.get("merch_desc") or "",
+        "account": s.username,
+    }
+
+
+# ============================================================================ multi-account
+
+
+class AccountState:
+    """Ek account ka runtime state (session cache + failure tracking)."""
+
+    def __init__(self, phone: str, password: str):
+        self.phone = phone
+        self.password = password
+        self.session: HallSession | None = None
+        self.busy = False
+        self.failures = 0
+        self.orders = 0
+        self.cooldown_until = 0.0
+
+    def __repr__(self) -> str:
+        return (f"<Account {self.phone} orders={self.orders} "
+                f"failures={self.failures} cooling={self.cooldown_until > time.time()}>")
+
+
+class AccountManager:
+    """Multi-account payment gateway: round-robin rotation + fail par auto-switch.
+
+    accounts.json:
+        {"accounts": [{"phone": "+91-XXXXXXXXXX", "password": "secret", "enabled": true}]}
+
+    Bot `accounts` (list) directly de sakta hai — us case me wahi use hote hain
+    (accounts.json ignore ho jaati hai). Thread-safe (Telegram bot ke liye).
+    """
+
+    def __init__(self, config_path: str | Path = ACCOUNTS_FILE,
+                 cooldown: int = ORDER_COOLDOWN, max_attempts: int | None = None,
+                 accounts: list | None = None):
+        self.config_path = Path(config_path)
+        self.cooldown = cooldown
+        self.max_attempts = max_attempts
+        # Bot se seedha diye gaye accounts (Telegram admin commands) file se priority lete hain.
+        self._accounts_override: list = list(accounts) if accounts else []
+        self._lock = threading.Lock()
+        self._states: list[AccountState] = []
+        self._cursor = 0
+        self.reload()
+
+    # ------------------------------------------------------------------ config
+
+    def _load_raw(self) -> list:
+        """Accounts: bot override (agar diye gaye) → warna accounts.json file.
+        Missing/corrupt file par khaali list (crash nahi hota)."""
+        if self._accounts_override:
+            return self._accounts_override
+        try:
+            data = json.loads(self.config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        return data.get("accounts") if isinstance(data, dict) else data
+
+    def reload(self) -> int:
+        """accounts dobara padho (sessions reuse hote hain)."""
+        raw = self._load_raw()
+
+        known = {(st.phone, st.password): st for st in self._states}
+        states = []
+        for acc in raw or []:
+            if not isinstance(acc, dict):
+                continue
+            if acc.get("enabled", True) is False:
+                continue
+            phone, password = acc.get("phone"), acc.get("password")
+            if not phone or not password:
+                continue
+            key = (phone, password)
+            states.append(known.get(key) or AccountState(phone, password))
+
+        with self._lock:
+            self._states = states
+            self._cursor = 0
+        return len(states)
+
+    def active_count(self) -> int:
+        """Abhi kitne accounts active hain (cooldown ke regardless)."""
+        with self._lock:
+            return len(self._states)
+
+    def stats(self) -> list[dict]:
+        with self._lock:
+            return [
+                {"phone": st.phone, "orders": st.orders, "failures": st.failures,
+                 "cooldown": max(0, round(st.cooldown_until - time.time())), "busy": st.busy}
+                for st in self._states
+            ]
+
+    # --------------------------------------------------------------- scheduling
+
+    def _pick_locked(self, skip: set) -> AccountState | None:
+        """Round-robin se next account chuno. Lock ke andar hi call karo."""
+        n = len(self._states)
+        if not n:
+            return None
+        now = time.time()
+        order = [(self._cursor + i) % n for i in range(n)]
+        candidates = [i for i in order if self._states[i] not in skip]
+        if not candidates:
+            return None
+        ready = [i for i in candidates
+                 if not self._states[i].busy and self._states[i].cooldown_until <= now]
+        idx = (ready or candidates)[0]
+        self._cursor = (idx + 1) % n
+        return self._states[idx]
+
+    def _session_for(self, st: AccountState) -> HallSession:
+        if st.session is not None:
+            return st.session
+        login_data = HallClient().login(st.phone, st.password)
+        if login_data.get("code") != 1:
+            raise DepositError(f"login failed: {login_data.get('msg')}")
+        st.session = HallSession(login_data.get("data") or login_data)
+        return st.session
+
+    # ------------------------------------------------------------------- public
+
+    def get_payment_url(self, amount, kind_type: int = 1, channel_index: int = 0,
+                        sub_index: int | None = None) -> dict:
+        """Kisi bhi free account se deposit order banao aur payment URL return karo.
+        Sab accounts fail hone par DepositError raise hota hai."""
+        amount = str(amount).strip()
+        if not amount.isdigit() or int(amount) <= 0:
+            raise ValueError("amount must be a positive whole number")
+
+        limit = self.max_attempts or len(self._states)
+        tried: set = set()
+        errors: list[str] = []
+
+        while len(tried) < limit:
+            with self._lock:
+                st = self._pick_locked(tried)
+                if st is None:
+                    break
+                st.busy = True
+            tried.add(st)
+
+            try:
+                result = create_deposit(self._session_for(st), amount,
+                                        kind_type, channel_index, sub_index)
+                with self._lock:
+                    st.failures = 0
+                    st.orders += 1
+                result["account"] = st.phone
+                return result
+            except (DepositError, requests.RequestException, KeyError,
+                    ValueError, json.JSONDecodeError) as exc:
+                with self._lock:
+                    st.failures += 1
+                    st.cooldown_until = time.time() + self.cooldown
+                    st.session = None  # agli baar fresh login
+                errors.append(f"{st.phone}: {exc}")
+            finally:
+                with self._lock:
+                    st.busy = False
+
+        if errors:
+            raise DepositError("all accounts failed: " + "; ".join(errors))
+        raise DepositError(f"no accounts configured in {self.config_path}")
+
+
+_manager: AccountManager | None = None
+_manager_lock = threading.Lock()
+
+
+def configure_accounts(accounts, config_path: str | Path = ACCOUNTS_FILE,
+                       cooldown: int = ORDER_COOLDOWN) -> int:
+    """Bot admin jab bhi accounts change kare, ye call karo.
+
+    `accounts` = [{"phone": "...", "password": "..."}] — khaali list dene par
+    manager accounts.json file fallback use karega. Active account count return karta hai.
+    """
+    global _manager
+    with _manager_lock:
+        _manager = AccountManager(config_path=config_path, cooldown=cooldown,
+                                  accounts=accounts)
+        return _manager.active_count()
+
+
+def get_payment_url(amount, config_path: str | Path = ACCOUNTS_FILE, **kwargs) -> dict:
+    """Bot ke liye shortcut: ek shared AccountManager lazily bana kar use karta hai."""
+    global _manager
+    if _manager is None:
+        with _manager_lock:
+            if _manager is None:
+                _manager = AccountManager(config_path)
+    return _manager.get_payment_url(amount, **kwargs)
+
+
+# ============================================================================ cli
+
+
+def run(phone: str, password: str, amount: str, kind_type: int = 1, channel_index: int = 0):
+    login_data = HallClient().login(phone, password)
+    if login_data.get("code") != 1:
+        print("Login failed:", json.dumps(login_data, ensure_ascii=False))
+        return
+
+    s = HallSession(login_data.get("data") or login_data)
+    print(f"[+] Logged in as {s.username}")
+
+    try:
+        result = create_deposit(s, amount, kind_type, channel_index)
+    except DepositError as exc:
+        print("[-] Failed:", exc)
+        if exc.response is not None:
+            print(json.dumps(exc.response, indent=2, ensure_ascii=False)[:1200])
+        return
+
+    print(f"[+] sign_key = {s.sign_key}")
+    print(f"[+] account = {result['account']}, channel = {result['channel']}, "
+          f"sub = {result['sub_channel']}, amount = {result['amount']}")
+    print(f"[+] orderNo = {result['orderNo']}")
+    print("\n=== PAYMENT URL ===")
+    print(result["url"])
+    return result["url"]
+
+
+if __name__ == "__main__":
+    import sys
+
+    phone = sys.argv[1] if len(sys.argv) > 1 else input("Phone (+91-XXXXXXXXXX)? ")
+    password = sys.argv[2] if len(sys.argv) > 2 else input("Password? ")
+
+    amount = sys.argv[3] if len(sys.argv) > 3 else ""
+    while not amount.strip().isdigit() or int(amount) <= 0:
+        amount = input("Kitne ka deposit karna hai? (sirf number) ").strip()
+
+    run(phone, password, amount.strip())
